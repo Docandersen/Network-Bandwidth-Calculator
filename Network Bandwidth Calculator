@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI‑Augmented Enterprise Bandwidth Calculator</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    html, body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    .card { @apply bg-white/90 dark:bg-slate-900/80 backdrop-blur rounded-2xl shadow-md border border-slate-200 dark:border-slate-800; }
+    .card h3 { @apply text-slate-800 dark:text-slate-100 font-semibold; }
+    .label { @apply text-sm text-slate-600 dark:text-slate-300; }
+    .input { @apply w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-slate-900 dark:text-slate-100 shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500; }
+    .gridish { display:grid; grid-template-columns: repeat(12,minmax(0,1fr)); gap: 0.75rem; }
+    .subtle { @apply text-xs text-slate-500 dark:text-slate-400; }
+  </style>
+</head>
+<body class="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900">
+  <header class="sticky top-0 z-20 bg-white/80 dark:bg-slate-900/70 backdrop-blur border-b border-slate-200 dark:border-slate-800">
+    <div class="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="h-10 w-10 rounded-xl bg-indigo-600 text-white grid place-content-center font-black">BW</div>
+        <div>
+          <h1 class="text-xl md:text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white">AI‑Augmented Enterprise Bandwidth Calculator</h1>
+          <p class="subtle">Models Internet/WAN, Internal/LAN (East‑West), and Wireless/Edge — including AI training & inference, security overhead, and growth margins.</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <button id="btnPresetOffice" class="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-100">Preset: Office</button>
+        <button id="btnPresetFactory" class="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-100">Preset: Factory</button>
+        <button id="btnReset" class="px-3 py-2 rounded-xl bg-rose-100 hover:bg-rose-200 dark:bg-rose-900/40 dark:hover:bg-rose-900/60 text-rose-800 dark:text-rose-100">Reset</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto p-4 space-y-6">
+    <!-- Site Profile & Global Multipliers -->
+    <section class="card p-4">
+      <div class="gridish">
+        <div class="col-span-12 md:col-span-4">
+          <h3 class="mb-2">1) Site Profile</h3>
+          <label class="label">Location Type</label>
+          <select id="locationType" class="input">
+            <option value="office">Knowledge Worker (Office/Remote)</option>
+            <option value="factory">Manufacturing / Industrial (Factory)</option>
+          </select>
+          <div class="grid grid-cols-2 gap-3 mt-3">
+            <div>
+              <label class="label">Site Size</label>
+              <select id="siteSize" class="input">
+                <option value="critical">Critical</option>
+                <option value="large">Large</option>
+                <option value="medium" selected>Medium</option>
+                <option value="small">Small</option>
+                <option value="xs">Extra Small</option>
+              </select>
+            </div>
+            <div>
+              <label class="label">Downtime Tolerance</label>
+              <input id="downtimeTolerance" class="input" value="Hours" />
+            </div>
+          </div>
+          <p class="subtle mt-2">Tip: Presets adjust typical concurrencies and per‑user Mbps.
+          </p>
+        </div>
+        <div class="col-span-12 md:col-span-8">
+          <h3 class="mb-2">2) Global Overhead & Safety</h3>
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div>
+              <label class="label">Security Service Overhead ϕ<sub>sec</sub> (%)</label>
+              <input type="number" id="secOverhead" class="input" value="10" min="0" step="1" />
+            </div>
+            <div>
+              <label class="label">Protocol Overhead ϕ<sub>proto</sub> (%)</label>
+              <input type="number" id="protoOverhead" class="input" value="5" min="0" step="1" />
+            </div>
+            <div>
+              <label class="label">Safety & Growth Margin γ (×)</label>
+              <input type="number" id="safetyMargin" class="input" value="1.25" min="1" step="0.05" />
+            </div>
+            <div>
+              <label class="label">DDoS Surge Factor δ (×)</label>
+              <input type="number" id="ddosFactor" class="input" value="1.00" min="1" step="0.05" />
+            </div>
+          </div>
+          <div class="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div>
+              <label class="label">Provisioned WAN Down (Mbps)</label>
+              <input type="number" id="provDown" class="input" value="1000" min="0" step="10" />
+            </div>
+            <div>
+              <label class="label">Provisioned WAN Up (Mbps)</label>
+              <input type="number" id="provUp" class="input" value="1000" min="0" step="10" />
+            </div>
+            <div class="flex items-end gap-2">
+              <div class="flex items-center gap-2">
+                <input type="checkbox" id="symmetry" class="h-4 w-4" checked>
+                <label for="symmetry" class="label">Assume Symmetric Bandwidth</label>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Traditional Services -->
+    <section class="card p-4">
+      <h3 class="mb-3">Traditional Services (North–South)</h3>
+      <p class="subtle mb-3">Provide user counts, typical concurrency, and per‑user Mbps. Upload can exceed download for sync/backup.</p>
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead>
+            <tr class="text-left text-slate-600 dark:text-slate-300">
+              <th class="py-2 pr-3">Service</th>
+              <th class="py-2 pr-3">Users</th>
+              <th class="py-2 pr-3">Concurrency %</th>
+              <th class="py-2 pr-3">Mbps / User (Down)</th>
+              <th class="py-2 pr-3">Mbps / User (Up)</th>
+            </tr>
+          </thead>
+          <tbody id="tradBody" class="align-middle">
+            <!-- rows injected by JS -->
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-3 flex gap-2">
+        <button id="addTrad" class="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700">Add Service</button>
+        <button id="loadTradDefaults" class="px-3 py-2 rounded-xl bg-indigo-600 text-white">Load Typical Defaults</button>
+      </div>
+    </section>
+
+    <!-- AI Workloads -->
+    <section class="card p-4">
+      <h3 class="mb-3">AI Workloads</h3>
+      <div class="gridish">
+        <div class="col-span-12 md:col-span-7">
+          <div class="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
+            <h4 class="font-semibold mb-2">Inference (North–South, real‑time / bursty)</h4>
+            <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+              <div>
+                <label class="label">Requests / sec</label>
+                <input type="number" id="infRps" class="input" value="5" min="0" step="1" />
+              </div>
+              <div>
+                <label class="label">Avg Payload (MB)</label>
+                <input type="number" id="infPayloadMB" class="input" value="1.5" min="0" step="0.1" />
+              </div>
+              <div>
+                <label class="label">Upload Share (%)</label>
+                <input type="number" id="infUploadPct" class="input" value="40" min="0" max="100" step="1" />
+              </div>
+              <div>
+                <label class="label">Concurrent AI Users</label>
+                <input type="number" id="infUsers" class="input" value="50" min="0" step="1" />
+              </div>
+              <div>
+                <label class="label">Per‑User Mbps (extra)</label>
+                <input type="number" id="infPerUserMbps" class="input" value="0.3" min="0" step="0.05" />
+              </div>
+              <div class="flex items-end">
+                <p class="subtle">Formula: Mbps = (RPS × MB × 8) + (Users × per‑user)</p>
+              </div>
+            </div>
+          </div>
+          <div class="rounded-xl border border-slate-200 dark:border-slate-800 p-3 mt-3">
+            <h4 class="font-semibold mb-2">Additional Internal M2M (East–West)</h4>
+            <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+              <div>
+                <label class="label">M2M Avg (Mbps)</label>
+                <input type="number" id="m2mAvg" class="input" value="200" min="0" step="10" />
+              </div>
+              <div>
+                <label class="label">Peak Multiplier (×)</label>
+                <input type="number" id="m2mPeakMult" class="input" value="2" min="1" step="0.1" />
+              </div>
+              <div class="flex items-end"><p class="subtle">Added to East–West peak alongside Training.</p></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-12 md:col-span-5">
+          <div class="rounded-xl border border-slate-200 dark:border-slate-800 p-3 h-full">
+            <h4 class="font-semibold mb-2">Training (East–West, elephant flows)</h4>
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="label">Cluster Nodes (GPUs)</label>
+                <input type="number" id="trainNodes" class="input" value="32" min="0" step="1" />
+              </div>
+              <div>
+                <label class="label">Gbps / Node</label>
+                <input type="number" id="trainGbpsPerNode" class="input" value="10" min="0" step="1" />
+              </div>
+              <div>
+                <label class="label">Utilization (%)</label>
+                <input type="number" id="trainUtilPct" class="input" value="60" min="0" max="100" step="1" />
+              </div>
+              <div>
+                <label class="label">Latency Critical?</label>
+                <select id="latencyCritical" class="input">
+                  <option value="no" selected>No</option>
+                  <option value="yes">Yes</option>
+                </select>
+              </div>
+              <div class="col-span-2">
+                <p class="subtle">East–West Peak (Gbps) = Nodes × Gbps/Node × Util%.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Wireless / Edge -->
+    <section class="card p-4">
+      <h3 class="mb-3">Wireless / Edge</h3>
+      <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
+        <div>
+          <label class="label">Edge Devices</label>
+          <input type="number" id="edgeDevices" class="input" value="200" min="0" step="1" />
+        </div>
+        <div>
+          <label class="label">Concurrency %</label>
+          <input type="number" id="edgeConcPct" class="input" value="25" min="0" max="100" step="1" />
+        </div>
+        <div>
+          <label class="label">Mbps / Device (Down)</label>
+          <input type="number" id="edgePerDown" class="input" value="0.5" min="0" step="0.1" />
+        </div>
+        <div>
+          <label class="label">Mbps / Device (Up)</label>
+          <input type="number" id="edgePerUp" class="input" value="0.3" min="0" step="0.1" />
+        </div>
+        <div>
+          <label class="label">IoT / Sensor bias</label>
+          <select id="edgeBias" class="input">
+            <option value="balanced" selected>Balanced</option>
+            <option value="uplink">Uplink‑heavy (sensors)</option>
+            <option value="downlink">Downlink‑heavy (content)</option>
+          </select>
+        </div>
+      </div>
+    </section>
+
+    <!-- Actions -->
+    <section class="flex flex-wrap gap-3">
+      <button id="btnCalc" class="px-4 py-3 rounded-2xl bg-indigo-600 hover:bg-indigo-700 text-white font-semibold shadow">Calculate</button>
+      <button id="btnExportCSV" class="px-4 py-3 rounded-2xl bg-slate-900 hover:bg-black text-white font-semibold shadow">Export CSV</button>
+      <button id="btnPrint" class="px-4 py-3 rounded-2xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 font-semibold shadow">Print</button>
+    </section>
+
+    <!-- Outputs -->
+    <section class="gridish">
+      <div class="col-span-12 lg:col-span-7 space-y-4">
+        <div class="card p-4">
+          <h3 class="mb-2">Results — Required Bandwidth</h3>
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div class="rounded-xl bg-slate-50 dark:bg-slate-800 p-3">
+              <div class="subtle">Minimum Required Download (WAN)</div>
+              <div class="text-2xl font-bold" id="outWanDown">—</div>
+              <div class="subtle" id="outWanDownGbps">—</div>
+            </div>
+            <div class="rounded-xl bg-slate-50 dark:bg-slate-800 p-3">
+              <div class="subtle">Minimum Required Upload (WAN)</div>
+              <div class="text-2xl font-bold" id="outWanUp">—</div>
+              <div class="subtle" id="outWanUpGbps">—</div>
+            </div>
+            <div class="rounded-xl bg-slate-50 dark:bg-slate-800 p-3">
+              <div class="subtle">AI Training East–West Peak</div>
+              <div class="text-2xl font-bold" id="outEWPeak">—</div>
+              <div class="subtle" id="outEWPeakGbps">—</div>
+            </div>
+            <div class="rounded-xl bg-slate-50 dark:bg-slate-800 p-3">
+              <div class="subtle">Estimated WAN Utilization @ Peak</div>
+              <div class="text-2xl font-bold" id="outUtil">—</div>
+              <div class="subtle">vs provisioned</div>
+            </div>
+          </div>
+        </div>
+        <div class="card p-4">
+          <h3 class="mb-2">Breakdown — WAN Components (Mbps)</h3>
+          <canvas id="chartWan" height="160"></canvas>
+          <div class="subtle mt-2">Includes security, protocol, growth, and DDoS multipliers in totals; chart shows raw contributions.</div>
+        </div>
+        <div class="card p-4">
+          <h3 class="mb-2">Notes & Flags</h3>
+          <ul id="outNotes" class="list-disc pl-5 text-slate-700 dark:text-slate-200 text-sm space-y-1"></ul>
+        </div>
+      </div>
+      <div class="col-span-12 lg:col-span-5 space-y-4">
+        <div class="card p-4">
+          <h3 class="mb-2">Model & Formulae</h3>
+          <div class="text-sm text-slate-700 dark:text-slate-200 space-y-2">
+            <p><strong>Raw WAN (Down/Up):</strong> Sum of Traditional + Inference + Wireless/Edge components by direction.</p>
+            <p><strong>Final WAN:</strong> <code>Final = Raw × (1 + ϕ<sub>sec</sub>) × (1 + ϕ<sub>proto</sub>) × γ × δ</code></p>
+            <p><strong>Inference Mbps:</strong> <code>(RPS × MB × 8)</code> split into Down/Up by Upload Share, plus <code>Concurrent Users × per‑user Mbps</code>.</p>
+            <p><strong>Training East–West Peak (Gbps):</strong> <code>Nodes × (Gbps/Node) × Util%</code>.</p>
+            <p><strong>Wireless/Edge:</strong> <code>Devices × Concurrency × per‑device Mbps</code> by direction; bias can skew Up/Down.</p>
+            <p><strong>Latency Flag:</strong> If East–West ≥ 100 Gbps or critical latency is required, consider InfiniBand or 400/800G Ethernet fabric.</p>
+          </div>
+        </div>
+        <div class="card p-4">
+          <h3 class="mb-2">Export</h3>
+          <p class="text-sm text-slate-700 dark:text-slate-200">Use <em>Export CSV</em> and import into Google Sheets for sharing. Printing creates a one‑page summary.</p>
+        </div>
+      </div>
+    </section>
+
+    <footer class="text-center text-xs text-slate-500 py-6">© 2025 AI‑Augmented Bandwidth Calculator — QoS/QoE focused. Built for WAN, LAN (East‑West), and Edge.</footer>
+  </main>
+
+  <script>
+    // ---------- Utilities ----------
+    const fmtMbps = (v) => `${(v).toLocaleString(undefined,{maximumFractionDigits:0})} Mbps`;
+    const fmtGbps = (vMbps) => `${(vMbps/1000).toFixed(2)} Gbps`;
+
+    // Traditional defaults
+    const defaultTrad = [
+      { name: 'Email / Web', users: 1000, concPct: 20, mbpsDown: 0.2, mbpsUp: 0.05 },
+      { name: 'Cloud / SaaS', users: 1000, concPct: 15, mbpsDown: 0.6, mbpsUp: 0.2 },
+      { name: 'Video Conferencing', users: 400, concPct: 25, mbpsDown: 1.8, mbpsUp: 1.8 },
+      { name: 'VoIP Telephony', users: 800, concPct: 35, mbpsDown: 0.1, mbpsUp: 0.1 },
+      { name: 'File Sync / Backup', users: 600, concPct: 10, mbpsDown: 0.5, mbpsUp: 1.0 },
+    ];
+
+    const table = document.getElementById('tradBody');
+
+    function addTradRow(row={name:'Service', users:100, concPct:20, mbpsDown:0.2, mbpsUp:0.1}){
+      const tr = document.createElement('tr');
+      tr.className = 'border-t border-slate-200 dark:border-slate-800';
+      tr.innerHTML = `
+        <td class="py-2 pr-3"><input class="input" value="${row.name}" /></td>
+        <td class="py-2 pr-3"><input type="number" class="input" value="${row.users}" min="0" step="1" /></td>
+        <td class="py-2 pr-3"><input type="number" class="input" value="${row.concPct}" min="0" max="100" step="1" /></td>
+        <td class="py-2 pr-3"><input type="number" class="input" value="${row.mbpsDown}" min="0" step="0.05" /></td>
+        <td class="py-2 pr-3 flex items-center gap-2">
+          <input type="number" class="input" value="${row.mbpsUp}" min="0" step="0.05" />
+          <button class="px-2 py-1 rounded-lg bg-rose-50 dark:bg-rose-900/30 text-rose-700 dark:text-rose-100" title="Remove">×</button>
+        </td>`;
+      tr.querySelector('button').addEventListener('click',()=>{ tr.remove(); update(); });
+      table.appendChild(tr);
+    }
+
+    function loadDefaults(){ table.innerHTML=''; defaultTrad.forEach(addTradRow); }
+
+    document.getElementById('addTrad').addEventListener('click', ()=> addTradRow());
+    document.getElementById('loadTradDefaults').addEventListener('click', loadDefaults);
+
+    // Presets
+    document.getElementById('btnPresetOffice').addEventListener('click', ()=>{
+      document.getElementById('locationType').value='office';
+      document.getElementById('siteSize').value='medium';
+      document.getElementById('secOverhead').value=10;
+      document.getElementById('protoOverhead').value=5;
+      document.getElementById('safetyMargin').value=1.25;
+      document.getElementById('ddosFactor').value=1.0;
+      loadDefaults();
+      update();
+    });
+    document.getElementById('btnPresetFactory').addEventListener('click', ()=>{
+      document.getElementById('locationType').value='factory';
+      document.getElementById('siteSize').value='large';
+      document.getElementById('secOverhead').value=12;
+      document.getElementById('protoOverhead').value=6;
+      document.getElementById('safetyMargin').value=1.35;
+      document.getElementById('ddosFactor').value=1.1;
+      loadDefaults();
+      // bias more uplink for sensors
+      document.getElementById('edgeBias').value='uplink';
+      document.getElementById('edgeDevices').value=1200;
+      document.getElementById('edgeConcPct').value=35;
+      document.getElementById('edgePerDown').value=0.2;
+      document.getElementById('edgePerUp').value=0.5;
+      // training heavier
+      document.getElementById('trainNodes').value=128;
+      document.getElementById('trainGbpsPerNode').value=25;
+      document.getElementById('trainUtilPct').value=70;
+      update();
+    });
+
+    document.getElementById('btnReset').addEventListener('click', ()=>{ window.location.reload(); });
+    document.getElementById('btnPrint').addEventListener('click', ()=> window.print());
+
+    // Chart setup
+    let chartWan;
+    function renderChart(data){
+      const ctx = document.getElementById('chartWan');
+      const labels = Object.keys(data);
+      const values = Object.values(data);
+      if(chartWan){ chartWan.destroy(); }
+      chartWan = new Chart(ctx, {
+        type: 'bar',
+        data: { labels, datasets: [{ label: 'Raw WAN Mbps', data: values }] },
+        options: { responsive:true, maintainAspectRatio:false, plugins:{ legend:{display:true} }, scales:{ y:{ beginAtZero:true } } }
+      });
+    }
+
+    // Core calculation
+    function readTrad(){
+      const rows = [...table.querySelectorAll('tr')];
+      return rows.map(tr=>{
+        const [nameEl, usersEl, concEl, downEl, upEl] = tr.querySelectorAll('input');
+        const users = +usersEl.value||0; const conc = (+concEl.value||0)/100;
+        const down = +downEl.value||0; const up = +upEl.value||0;
+        return {
+          name: nameEl.value,
+          rawDown: users*conc*down,
+          rawUp: users*conc*up
+        };
+      });
+    }
+
+    function calc(){
+      const symmetry = document.getElementById('symmetry').checked;
+      const sec = (+document.getElementById('secOverhead').value||0)/100;
+      const proto = (+document.getElementById('protoOverhead').value||0)/100;
+      const gamma = +document.getElementById('safetyMargin').value||1;
+      const ddos = +document.getElementById('ddosFactor').value||1;
+
+      // Traditional
+      const trad = readTrad();
+      const tradDown = trad.reduce((s,r)=>s+r.rawDown,0);
+      const tradUp = trad.reduce((s,r)=>s+r.rawUp,0);
+
+      // Inference
+      const rps = +document.getElementById('infRps').value||0;
+      const mb = +document.getElementById('infPayloadMB').value||0; // MB
+      const upShare = Math.min(100,Math.max(0,+document.getElementById('infUploadPct').value||0))/100; // portion that is upload
+      const users = +document.getElementById('infUsers').value||0;
+      const perUser = +document.getElementById('infPerUserMbps').value||0;
+      const infTotal = (rps*mb*8) + (users*perUser); // Mbps total (bidirectional)
+      const infUp = infTotal*upShare;
+      const infDown = infTotal - infUp;
+
+      // Wireless / Edge
+      const ed = +document.getElementById('edgeDevices').value||0;
+      const ec = ( +document.getElementById('edgeConcPct').value||0 )/100;
+      let eDown = ed*ec*(+document.getElementById('edgePerDown').value||0);
+      let eUp   = ed*ec*(+document.getElementById('edgePerUp').value||0);
+      const bias = document.getElementById('edgeBias').value;
+      if(bias==='uplink'){ eUp*=1.2; }
+      if(bias==='downlink'){ eDown*=1.2; }
+
+      // Raw WAN totals
+      let rawWanDown = tradDown + infDown + eDown;
+      let rawWanUp   = tradUp + infUp + eUp;
+
+      if(symmetry){
+        const maxDir = Math.max(rawWanDown, rawWanUp);
+        rawWanDown = maxDir; rawWanUp = maxDir;
+      }
+
+      // Overhead multiplier
+      const mult = (1+sec)*(1+proto)*gamma*ddos;
+      const finalWanDown = rawWanDown * mult;
+      const finalWanUp   = rawWanUp   * mult;
+
+      // East‑West (Training + M2M)
+      const tNodes = +document.getElementById('trainNodes').value||0;
+      const tGbpsNode = +document.getElementById('trainGbpsPerNode').value||0;
+      const tUtil = Math.min(100,Math.max(0,+document.getElementById('trainUtilPct').value||0))/100;
+      const trainGbps = tNodes * tGbpsNode * tUtil; // Gbps
+
+      const m2mAvg = +document.getElementById('m2mAvg').value||0; // Mbps
+      const m2mPeakMult = +document.getElementById('m2mPeakMult').value||1;
+      const m2mPeakGbps = (m2mAvg*m2mPeakMult)/1000; // Gbps
+      const eastWestPeakGbps = trainGbps + m2mPeakGbps;
+
+      // Utilization vs provisioned
+      const pDown = +document.getElementById('provDown').value||0;
+      const pUp = +document.getElementById('provUp').value||0;
+      const utilDown = pDown ? finalWanDown / pDown : 0;
+      const utilUp   = pUp   ? finalWanUp   / pUp   : 0;
+      const util = Math.max(utilDown, utilUp);
+
+      // Flags / Notes
+      const notes = [];
+      const loc = document.getElementById('locationType').value;
+      if(eastWestPeakGbps >= 100 || document.getElementById('latencyCritical').value==='yes'){
+        notes.push('Ultra‑low‑latency fabric likely required (InfiniBand or 400/800G Ethernet with ECN/RDMA).');
+      }
+      if(util >= 0.8 && util < 1){ notes.push('Provisioned WAN may saturate during peaks (≥80% utilization). Consider upgrading or increasing γ.'); }
+      if(util >= 1){ notes.push('Provisioned WAN is insufficient at peak. Increase capacity or reduce load.'); }
+      if(ddos>1){ notes.push('DDoS surge capacity reserved; ensure upstream provider honors burst capacity.'); }
+      if(loc==='factory'){ notes.push('Factory profile: prioritize deterministic latency and reserve bandwidth for telemetry ingestion.'); }
+
+      return {
+        componentsRaw: {
+          'Traditional Down': Math.round(tradDown),
+          'Traditional Up': Math.round(tradUp),
+          'Inference Down': Math.round(infDown),
+          'Inference Up': Math.round(infUp),
+          'Edge Down': Math.round(eDown),
+          'Edge Up': Math.round(eUp)
+        },
+        finalWanDown, finalWanUp,
+        eastWestPeakGbps,
+        utilization: util,
+        notes
+      };
+    }
+
+    function update(){
+      const r = calc();
+      document.getElementById('outWanDown').textContent = fmtMbps(Math.round(r.finalWanDown));
+      document.getElementById('outWanUp').textContent   = fmtMbps(Math.round(r.finalWanUp));
+      document.getElementById('outWanDownGbps').textContent = fmtGbps(r.finalWanDown);
+      document.getElementById('outWanUpGbps').textContent   = fmtGbps(r.finalWanUp);
+      document.getElementById('outEWPeak').textContent = `${r.eastWestPeakGbps.toFixed(1)} Gbps`;
+      document.getElementById('outEWPeakGbps').textContent = r.eastWestPeakGbps>=100? 'Latency‑sensitive / elephant flows' : 'Moderate East–West';
+      document.getElementById('outUtil').textContent = `${(r.utilization*100).toFixed(0)}%`;
+
+      // Notes
+      const ul = document.getElementById('outNotes');
+      ul.innerHTML='';
+      r.notes.forEach(n=>{ const li=document.createElement('li'); li.textContent=n; ul.appendChild(li); });
+
+      // Chart
+      renderChart(r.componentsRaw);
+    }
+
+    // CSV Export
+    function exportCSV(){
+      const r = calc();
+      const rows = [
+        ['Metric','Value'],
+        ['Final WAN Down (Mbps)', Math.round(r.finalWanDown)],
+        ['Final WAN Up (Mbps)', Math.round(r.finalWanUp)],
+        ['AI Training East‑West Peak (Gbps)', r.eastWestPeakGbps.toFixed(2)],
+        ['Estimated WAN Utilization @ Peak', (r.utilization*100).toFixed(0)+'%'],
+        [],
+        ['Raw WAN Components (Mbps)',''],
+        ...Object.entries(r.componentsRaw).map(([k,v])=>[k,v])
+      ];
+      const csv = rows.map(row=>row.map(x=>`"${String(x).replaceAll('"','""')}"`).join(',')).join('\n');
+      const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'bandwidth-calculator-export.csv'; a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    document.getElementById('btnExportCSV').addEventListener('click', exportCSV);
+    document.getElementById('btnCalc').addEventListener('click', update);
+
+    // Auto-update on changes
+    document.addEventListener('input', (e)=>{
+      const target = e.target;
+      if(target.classList.contains('input')){ update(); }
+    });
+
+    // Init
+    loadDefaults();
+    update();
+  </script>
+</body>
+</html>
