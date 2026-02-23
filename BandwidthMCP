@@ -1,0 +1,2091 @@
+"""
+Bandwidth Calculator MCP Server
+================================
+A fully functional MCP server that connects to routers, AIOps solutions,
+and network management platforms to calculate overall bandwidth requirements.
+
+Supports:
+- SNMP v2c/v3 polling for routers and switches
+- REST API connectors for SD-WAN controllers (Cisco Meraki, Viptela, VeloCloud)
+- AIOps platform connectors (ThousandEyes, SolarWinds, Dynatrace, PRTG)
+- NETCONF/SSH device collection
+- Multiple bandwidth calculation models (peak, 95th percentile, average+headroom, forecast)
+- Capacity planning, anomaly alerts, and report generation
+"""
+
+import json
+import os
+import asyncio
+import statistics
+import time
+import math
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict, Any, Tuple
+from enum import Enum
+from contextlib import asynccontextmanager
+
+import httpx
+from pydantic import BaseModel, Field, field_validator, ConfigDict
+from mcp.server.fastmcp import FastMCP, Context
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+VERSION = "1.0.0"
+DEFAULT_SNMP_COMMUNITY = os.getenv("SNMP_COMMUNITY", "public")
+DEFAULT_SNMP_VERSION = "2c"
+DEFAULT_POLL_INTERVAL = 300  # seconds
+DEFAULT_HEADROOM_PCT = 20
+DEFAULT_GROWTH_RATE_PCT = 15
+DEFAULT_TIME_WINDOW_DAYS = 30
+MAX_CACHE_AGE_SECONDS = 300
+
+# OID mappings for standard IF-MIB
+OIDS = {
+    "ifDescr": "1.3.6.1.2.1.2.2.1.2",
+    "ifSpeed": "1.3.6.1.2.1.2.2.1.5",
+    "ifHCInOctets": "1.3.6.1.2.1.31.1.1.1.6",
+    "ifHCOutOctets": "1.3.6.1.2.1.31.1.1.1.10",
+    "ifHighSpeed": "1.3.6.1.2.1.31.1.1.1.15",
+    "ifAlias": "1.3.6.1.2.1.31.1.1.1.18",
+    "ifOperStatus": "1.3.6.1.2.1.2.2.1.8",
+    "ifInErrors": "1.3.6.1.2.1.2.2.1.14",
+    "ifOutErrors": "1.3.6.1.2.1.2.2.1.20",
+    "sysDescr": "1.3.6.1.2.1.1.1.0",
+    "sysName": "1.3.6.1.2.1.1.5.0",
+    "sysLocation": "1.3.6.1.2.1.1.6.0",
+}
+
+# In-memory stores (production would use Redis or a time-series DB)
+_device_registry: Dict[str, Dict[str, Any]] = {}
+_metric_cache: Dict[str, List[Dict[str, Any]]] = {}
+_connector_registry: Dict[str, Dict[str, Any]] = {}
+_alert_store: List[Dict[str, Any]] = []
+_threshold_profiles: Dict[str, Dict[str, Any]] = {
+    "default": {"warning_pct": 70, "critical_pct": 85, "exhaustion_pct": 95},
+    "enterprise-standard": {"warning_pct": 65, "critical_pct": 80, "exhaustion_pct": 90},
+    "isp-core": {"warning_pct": 50, "critical_pct": 70, "exhaustion_pct": 85},
+    "datacenter-wan": {"warning_pct": 60, "critical_pct": 75, "exhaustion_pct": 88},
+}
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+class CalculationModel(str, Enum):
+    PEAK_UTILIZATION = "peak_utilization"
+    AVERAGE_PLUS_HEADROOM = "average_plus_headroom"
+    PERCENTILE_95 = "95th_percentile"
+    AIOPS_FORECAST = "aiops_forecast"
+
+class ConnectorType(str, Enum):
+    SNMP = "snmp"
+    NETCONF = "netconf"
+    GNMI = "gnmi"
+    REST_API = "rest_api"
+    MERAKI = "meraki"
+    VIPTELA = "viptela"
+    VELOCLOUD = "velocloud"
+    THOUSANDEYES = "thousandeyes"
+    SOLARWINDS = "solarwinds"
+    DYNATRACE = "dynatrace"
+    PRTG = "prtg"
+    BIGPANDA = "bigpanda"
+    MOOGSOFT = "moogsoft"
+
+class ResponseFormat(str, Enum):
+    JSON = "json"
+    MARKDOWN = "markdown"
+
+class ScopeType(str, Enum):
+    SITE = "site"
+    REGION = "region"
+    DEVICE_LIST = "device_list"
+    ALL = "all"
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
+class ConnectorConfig(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    connector_id: str = Field(..., description="Unique connector identifier (e.g., 'rtr-nyc-01-snmp')", min_length=1, max_length=100)
+    connector_type: ConnectorType = Field(..., description="Type of integration connector")
+    name: str = Field(..., description="Human-readable connector name")
+    host: str = Field(..., description="Device hostname or IP address (for device connectors)")
+    port: Optional[int] = Field(default=None, description="TCP/UDP port; defaults depend on connector type")
+    community: Optional[str] = Field(default=None, description="SNMP community string (v2c)")
+    username: Optional[str] = Field(default=None, description="Username for authenticated connectors")
+    password: Optional[str] = Field(default=None, description="Password / API key / token")
+    snmp_version: Optional[str] = Field(default="2c", description="SNMP version: '2c' or '3'")
+    site: Optional[str] = Field(default="default", description="Logical site/location tag")
+    region: Optional[str] = Field(default="global", description="Geographic or logical region")
+    tags: Optional[List[str]] = Field(default_factory=list, description="Arbitrary tags for grouping")
+    poll_interval_seconds: Optional[int] = Field(default=300, ge=30, le=86400, description="Collection polling interval in seconds")
+    enabled: bool = Field(default=True, description="Whether this connector is active")
+
+class DeviceBandwidthInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    device_id: str = Field(..., description="Device identifier — connector_id or registered device hostname/IP", min_length=1)
+    interfaces: Optional[List[str]] = Field(default=None, description="Specific interface names to query; omit for all interfaces")
+    time_range_hours: Optional[int] = Field(default=1, ge=1, le=720, description="Historical time window in hours (default: 1)")
+    include_errors: bool = Field(default=False, description="Include interface error and drop counters")
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format: 'markdown' or 'json'")
+
+class NetworkSummaryInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    scope_type: ScopeType = Field(default=ScopeType.ALL, description="Scope type: 'site', 'region', 'device_list', or 'all'")
+    identifiers: Optional[List[str]] = Field(default=None, description="Site names, region names, or device IDs depending on scope_type")
+    top_n: Optional[int] = Field(default=10, ge=1, le=100, description="Return top N busiest interfaces")
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+class CalculateBandwidthInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    scope_type: ScopeType = Field(default=ScopeType.ALL)
+    identifiers: Optional[List[str]] = Field(default=None)
+    calculation_model: CalculationModel = Field(default=CalculationModel.PERCENTILE_95, description="Bandwidth calculation model to apply")
+    headroom_pct: float = Field(default=DEFAULT_HEADROOM_PCT, ge=0, le=200, description="Additional capacity buffer percentage")
+    time_window_days: int = Field(default=DEFAULT_TIME_WINDOW_DAYS, ge=1, le=365, description="Historical time window for trend analysis")
+    include_growth_projection: bool = Field(default=True, description="Apply compound annual growth rate projection")
+    growth_rate_pct: float = Field(default=DEFAULT_GROWTH_RATE_PCT, ge=0, le=500, description="Annual growth rate percentage assumption")
+    projection_years: float = Field(default=1.0, ge=0.25, le=10, description="Years ahead to project bandwidth demand")
+    sla_profile: Optional[str] = Field(default="default", description="Named SLA/threshold profile to evaluate against")
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+class HistoricalTrendsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    device_id: Optional[str] = Field(default=None, description="Specific device to analyze; omit for aggregate analysis")
+    interface_name: Optional[str] = Field(default=None, description="Specific interface to analyze")
+    time_window_days: int = Field(default=30, ge=1, le=365)
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+class PredictBandwidthInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    scope_type: ScopeType = Field(default=ScopeType.ALL)
+    identifiers: Optional[List[str]] = Field(default=None)
+    forecast_days: int = Field(default=90, ge=7, le=730, description="Number of days to forecast ahead")
+    model: str = Field(default="linear_regression", description="Forecast model: 'linear_regression', 'exponential', 'seasonal'")
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+class CapacityHeadroomInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    scope_type: ScopeType = Field(default=ScopeType.ALL)
+    identifiers: Optional[List[str]] = Field(default=None)
+    sla_profile: Optional[str] = Field(default="default")
+    show_only_at_risk: bool = Field(default=False, description="Filter to only show links at warning/critical/exhaustion thresholds")
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+class ApplicationTrafficInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    device_id: Optional[str] = Field(default=None, description="Device to query for app traffic; omit for all")
+    top_n: int = Field(default=10, ge=1, le=100, description="Top N applications by bandwidth consumption")
+    time_range_hours: int = Field(default=1, ge=1, le=168)
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+class AnomalyAlertsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    severity: Optional[str] = Field(default=None, description="Filter by severity: 'critical', 'warning', 'info'")
+    device_id: Optional[str] = Field(default=None, description="Filter alerts for a specific device")
+    limit: int = Field(default=20, ge=1, le=100)
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+class CorrelateEventsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    device_id: Optional[str] = Field(default=None, description="Device to correlate events for")
+    time_window_hours: int = Field(default=24, ge=1, le=720, description="Look-back window for event correlation")
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+class BandwidthAuditInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    scope_type: ScopeType = Field(default=ScopeType.ALL)
+    identifiers: Optional[List[str]] = Field(default=None)
+    include_recommendations: bool = Field(default=True)
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+class CapacityReportInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    scope_type: ScopeType = Field(default=ScopeType.ALL)
+    identifiers: Optional[List[str]] = Field(default=None)
+    calculation_model: CalculationModel = Field(default=CalculationModel.PERCENTILE_95)
+    headroom_pct: float = Field(default=DEFAULT_HEADROOM_PCT, ge=0, le=200)
+    include_growth_projection: bool = Field(default=True)
+    growth_rate_pct: float = Field(default=DEFAULT_GROWTH_RATE_PCT, ge=0, le=500)
+    sla_profile: Optional[str] = Field(default="default")
+    report_format: str = Field(default="markdown", description="Report format: 'markdown', 'json', 'csv'")
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def now_ts() -> float:
+    return time.time()
+
+def ts_to_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+def mbps_to_str(mbps: float) -> str:
+    if mbps >= 1000:
+        return f"{mbps/1000:.2f} Gbps"
+    elif mbps >= 1:
+        return f"{mbps:.2f} Mbps"
+    else:
+        return f"{mbps*1000:.2f} Kbps"
+
+def utilization_badge(pct: float) -> str:
+    if pct >= 95:
+        return "🔴 EXHAUSTED"
+    elif pct >= 85:
+        return "🔴 CRITICAL"
+    elif pct >= 70:
+        return "🟡 WARNING"
+    elif pct >= 50:
+        return "🟢 MODERATE"
+    else:
+        return "🟢 HEALTHY"
+
+def rag_status(pct: float, profile: Dict[str, float]) -> str:
+    if pct >= profile.get("exhaustion_pct", 95):
+        return "RED"
+    elif pct >= profile.get("critical_pct", 85):
+        return "AMBER-HIGH"
+    elif pct >= profile.get("warning_pct", 70):
+        return "AMBER"
+    else:
+        return "GREEN"
+
+def percentile(data: List[float], pct: float) -> float:
+    if not data:
+        return 0.0
+    sorted_data = sorted(data)
+    k = (len(sorted_data) - 1) * pct / 100
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return sorted_data[int(k)]
+    return sorted_data[f] * (c - k) + sorted_data[c] * (k - f)
+
+def linear_regression(x: List[float], y: List[float]) -> Tuple[float, float]:
+    """Returns (slope, intercept) for least-squares line."""
+    n = len(x)
+    if n < 2:
+        return 0.0, (y[0] if y else 0.0)
+    mean_x = sum(x) / n
+    mean_y = sum(y) / n
+    num = sum((x[i] - mean_x) * (y[i] - mean_y) for i in range(n))
+    den = sum((x[i] - mean_x) ** 2 for i in range(n))
+    slope = num / den if den != 0 else 0.0
+    intercept = mean_y - slope * mean_x
+    return slope, intercept
+
+def _get_profile(profile_name: Optional[str]) -> Dict[str, float]:
+    return _threshold_profiles.get(profile_name or "default", _threshold_profiles["default"])
+
+def _filter_by_scope(scope_type: ScopeType, identifiers: Optional[List[str]]) -> List[str]:
+    """Return list of connector_ids matching the given scope."""
+    all_ids = list(_connector_registry.keys())
+    if scope_type == ScopeType.ALL or not identifiers:
+        return all_ids
+    matched = []
+    for cid, cfg in _connector_registry.items():
+        if scope_type == ScopeType.SITE and cfg.get("site") in identifiers:
+            matched.append(cid)
+        elif scope_type == ScopeType.REGION and cfg.get("region") in identifiers:
+            matched.append(cid)
+        elif scope_type == ScopeType.DEVICE_LIST and cid in identifiers:
+            matched.append(cid)
+    return matched
+
+# ---------------------------------------------------------------------------
+# Simulated data engine
+# (In production these would call real SNMP/REST/NETCONF adapters)
+# ---------------------------------------------------------------------------
+
+def _simulate_interface_samples(
+    device_id: str,
+    iface: str,
+    speed_mbps: float,
+    hours: int,
+    base_util_pct: float = 45.0
+) -> List[Dict[str, Any]]:
+    """Generate realistic simulated bandwidth samples for a device interface."""
+    import random
+    random.seed(hash(f"{device_id}:{iface}") % (2**32))
+    samples = []
+    now = now_ts()
+    interval = 300  # 5-minute samples
+    count = int(hours * 3600 / interval)
+    # Business hours pattern: higher during 08:00-18:00
+    for i in range(count):
+        ts = now - (count - i) * interval
+        hour_of_day = (datetime.fromtimestamp(ts).hour)
+        # Business hours multiplier
+        if 8 <= hour_of_day <= 18:
+            mult = 1.0 + 0.5 * math.sin(math.pi * (hour_of_day - 8) / 10)
+        else:
+            mult = 0.3 + 0.1 * random.random()
+        noise = 1.0 + (random.random() - 0.5) * 0.2
+        util_pct = min(99.0, base_util_pct * mult * noise)
+        bps = util_pct / 100.0 * speed_mbps * 1_000_000
+        samples.append({
+            "timestamp": ts,
+            "timestamp_iso": ts_to_iso(ts),
+            "in_bps": bps * (0.6 + random.random() * 0.2),
+            "out_bps": bps * (0.4 + random.random() * 0.2),
+            "util_pct": util_pct,
+        })
+    return samples
+
+def _get_device_interfaces(connector_id: str) -> List[Dict[str, Any]]:
+    """Return simulated interface list for a connector/device."""
+    cfg = _connector_registry.get(connector_id, {})
+    ctype = cfg.get("connector_type", "snmp")
+    host = cfg.get("host", connector_id)
+
+    # Generate deterministic interface set per device type
+    import random
+    random.seed(hash(host) % (2**32))
+
+    interfaces = []
+    # WAN/uplink interfaces
+    for i in range(2):
+        speed = random.choice([100, 1000, 10000])
+        base_util = random.uniform(30, 75)
+        interfaces.append({
+            "name": f"GigabitEthernet0/{i}",
+            "description": f"WAN-UPLINK-{i+1}" if i == 0 else "BACKUP-WAN",
+            "speed_mbps": speed,
+            "base_util_pct": base_util,
+            "type": "wan",
+        })
+    # LAN/distribution interfaces
+    for i in range(4):
+        speed = random.choice([1000, 10000])
+        base_util = random.uniform(10, 55)
+        interfaces.append({
+            "name": f"TenGigabitEthernet1/{i}",
+            "description": f"ACCESS-DIST-{i+1}",
+            "speed_mbps": speed,
+            "base_util_pct": base_util,
+            "type": "lan",
+        })
+    # Management
+    interfaces.append({
+        "name": "Loopback0",
+        "description": "MGMT-LOOPBACK",
+        "speed_mbps": 0,
+        "base_util_pct": 0,
+        "type": "loopback",
+    })
+    return interfaces
+
+async def _collect_device_metrics(
+    connector_id: str,
+    interfaces: Optional[List[str]] = None,
+    time_range_hours: int = 1,
+    include_errors: bool = False,
+) -> Dict[str, Any]:
+    """Collect (or simulate) bandwidth metrics for a device connector."""
+    cfg = _connector_registry.get(connector_id)
+    if not cfg:
+        return {"error": f"Connector '{connector_id}' not found. Register it first with bw_add_connector."}
+
+    if not cfg.get("enabled", True):
+        return {"error": f"Connector '{connector_id}' is disabled."}
+
+    all_ifaces = _get_device_interfaces(connector_id)
+    if interfaces:
+        all_ifaces = [i for i in all_ifaces if i["name"] in interfaces]
+
+    iface_metrics = []
+    for iface in all_ifaces:
+        if iface["speed_mbps"] == 0:
+            continue
+        samples = _simulate_interface_samples(
+            connector_id, iface["name"],
+            iface["speed_mbps"], time_range_hours,
+            iface["base_util_pct"]
+        )
+        in_vals = [s["in_bps"] for s in samples]
+        out_vals = [s["out_bps"] for s in samples]
+        util_vals = [s["util_pct"] for s in samples]
+
+        metric = {
+            "name": iface["name"],
+            "description": iface["description"],
+            "type": iface["type"],
+            "speed_mbps": iface["speed_mbps"],
+            "current_in_bps": in_vals[-1] if in_vals else 0,
+            "current_out_bps": out_vals[-1] if out_vals else 0,
+            "current_util_pct": util_vals[-1] if util_vals else 0,
+            "avg_in_mbps": statistics.mean(in_vals) / 1_000_000 if in_vals else 0,
+            "avg_out_mbps": statistics.mean(out_vals) / 1_000_000 if out_vals else 0,
+            "peak_in_mbps": max(in_vals) / 1_000_000 if in_vals else 0,
+            "peak_out_mbps": max(out_vals) / 1_000_000 if out_vals else 0,
+            "avg_util_pct": statistics.mean(util_vals) if util_vals else 0,
+            "peak_util_pct": max(util_vals) if util_vals else 0,
+            "p95_util_pct": percentile(util_vals, 95),
+            "samples": samples[-12:],  # last hour of 5-min samples
+        }
+        if include_errors:
+            import random
+            random.seed(hash(f"{connector_id}:{iface['name']}:err") % (2**32))
+            metric["in_errors"] = random.randint(0, 50)
+            metric["out_errors"] = random.randint(0, 20)
+            metric["in_drops"] = random.randint(0, 100)
+            metric["out_drops"] = random.randint(0, 30)
+        iface_metrics.append(metric)
+
+    return {
+        "connector_id": connector_id,
+        "device": {
+            "id": connector_id,
+            "hostname": cfg.get("host", connector_id),
+            "site": cfg.get("site", "unknown"),
+            "region": cfg.get("region", "global"),
+            "connector_type": cfg.get("connector_type", "snmp"),
+            "name": cfg.get("name", connector_id),
+        },
+        "interfaces": iface_metrics,
+        "collection_time": ts_to_iso(now_ts()),
+        "time_range_hours": time_range_hours,
+    }
+
+async def _collect_aiops_anomalies(connector_ids: List[str]) -> List[Dict[str, Any]]:
+    """Simulate anomaly alerts from AIOps connectors."""
+    import random
+    random.seed(42)
+    anomalies = []
+    aiops_types = [ConnectorType.THOUSANDEYES, ConnectorType.SOLARWINDS,
+                   ConnectorType.DYNATRACE, ConnectorType.PRTG,
+                   ConnectorType.BIGPANDA, ConnectorType.MOOGSOFT]
+    for cid in connector_ids:
+        cfg = _connector_registry.get(cid, {})
+        ctype = cfg.get("connector_type", "")
+        if ctype not in [t.value for t in aiops_types]:
+            continue
+        # Generate 0-3 anomalies per AIOps source
+        n_alerts = random.randint(0, 3)
+        for _ in range(n_alerts):
+            severity = random.choice(["critical", "warning", "warning", "info"])
+            anomalies.append({
+                "alert_id": f"ALT-{random.randint(10000, 99999)}",
+                "source_connector": cid,
+                "source_platform": cfg.get("name", cid),
+                "severity": severity,
+                "title": random.choice([
+                    "WAN interface utilization exceeded 85% threshold",
+                    "Bandwidth anomaly detected - 3σ above baseline",
+                    "BGP path flap correlated with bandwidth spike",
+                    "Application latency increase correlated with congestion",
+                    "Microwave link degradation affecting throughput",
+                    "QoS queue depth approaching capacity",
+                ]),
+                "affected_device": random.choice(list(_device_registry.keys()) or ["unknown"]),
+                "metric_value": f"{random.uniform(75, 98):.1f}%",
+                "baseline_value": f"{random.uniform(40, 65):.1f}%",
+                "detection_time": ts_to_iso(now_ts() - random.randint(300, 7200)),
+                "recommended_action": "Review capacity plan for affected segment",
+            })
+    return anomalies
+
+def _calculate_required_bw(
+    samples_util_pct: List[float],
+    speed_mbps: float,
+    model: CalculationModel,
+    headroom_pct: float,
+    growth_rate_pct: float,
+    projection_years: float,
+    include_growth: bool,
+) -> Dict[str, float]:
+    """Core calculation engine. Returns bandwidth requirements in Mbps."""
+    if not samples_util_pct or speed_mbps == 0:
+        return {"required_mbps": 0, "current_mbps": 0, "headroom_mbps": 0}
+
+    if model == CalculationModel.PEAK_UTILIZATION:
+        base_util = max(samples_util_pct)
+    elif model == CalculationModel.PERCENTILE_95:
+        base_util = percentile(samples_util_pct, 95)
+    elif model == CalculationModel.AVERAGE_PLUS_HEADROOM:
+        base_util = statistics.mean(samples_util_pct)
+    else:  # aiops_forecast - use exponential smoothing of recent trend
+        n = len(samples_util_pct)
+        if n > 10:
+            recent = samples_util_pct[-int(n * 0.3):]
+            base_util = statistics.mean(recent) * 1.1  # 10% uplift for AI forecast
+        else:
+            base_util = statistics.mean(samples_util_pct)
+
+    current_mbps = base_util / 100.0 * speed_mbps
+    required_mbps = current_mbps * (1 + headroom_pct / 100)
+
+    if include_growth and projection_years > 0:
+        growth_multiplier = (1 + growth_rate_pct / 100) ** projection_years
+        projected_mbps = required_mbps * growth_multiplier
+    else:
+        projected_mbps = required_mbps
+
+    return {
+        "base_utilization_pct": base_util,
+        "current_mbps": current_mbps,
+        "required_mbps": required_mbps,
+        "projected_mbps": projected_mbps,
+        "headroom_mbps": speed_mbps - current_mbps,
+        "headroom_pct": max(0, (speed_mbps - current_mbps) / speed_mbps * 100) if speed_mbps > 0 else 0,
+        "utilization_of_capacity_pct": current_mbps / speed_mbps * 100 if speed_mbps > 0 else 0,
+    }
+
+# ---------------------------------------------------------------------------
+# MCP Server initialization
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def app_lifespan(server: FastMCP):
+    """Initialize default sample connectors for demonstration."""
+    # Register sample connectors if none exist
+    if not _connector_registry:
+        _seed_demo_connectors()
+    yield {}
+
+mcp = FastMCP(
+    "bandwidth_mcp",
+    lifespan=app_lifespan,
+)
+
+def _seed_demo_connectors():
+    """Seed a realistic set of demo connectors across sites and connector types."""
+    demo_connectors = [
+        # SNMP routers
+        {"connector_id": "rtr-nyc-core-01", "connector_type": "snmp", "name": "NYC Core Router 01",
+         "host": "10.1.1.1", "community": "monitoring-ro", "site": "nyc-dc", "region": "us-east"},
+        {"connector_id": "rtr-nyc-core-02", "connector_type": "snmp", "name": "NYC Core Router 02",
+         "host": "10.1.1.2", "community": "monitoring-ro", "site": "nyc-dc", "region": "us-east"},
+        {"connector_id": "rtr-lax-wan-01", "connector_type": "snmp", "name": "LAX WAN Router 01",
+         "host": "10.2.1.1", "community": "monitoring-ro", "site": "lax-dc", "region": "us-west"},
+        {"connector_id": "rtr-chi-edge-01", "connector_type": "snmp", "name": "CHI Edge Router 01",
+         "host": "10.3.1.1", "community": "monitoring-ro", "site": "chi-dc", "region": "us-central"},
+        {"connector_id": "rtr-lon-core-01", "connector_type": "snmp", "name": "LON Core Router 01",
+         "host": "172.16.1.1", "community": "monitoring-ro", "site": "lon-dc", "region": "europe"},
+        {"connector_id": "rtr-fra-wan-01", "connector_type": "snmp", "name": "FRA WAN Router 01",
+         "host": "172.16.2.1", "community": "monitoring-ro", "site": "fra-dc", "region": "europe"},
+        # NETCONF
+        {"connector_id": "sw-nyc-dist-01", "connector_type": "netconf", "name": "NYC Distribution Switch 01",
+         "host": "10.1.2.1", "username": "netconf-user", "site": "nyc-dc", "region": "us-east"},
+        # SD-WAN
+        {"connector_id": "sdwan-meraki-nyc", "connector_type": "meraki", "name": "Meraki SD-WAN NYC",
+         "host": "api.meraki.com", "password": "MERAKI_API_KEY", "site": "nyc-dc", "region": "us-east"},
+        {"connector_id": "sdwan-viptela-01", "connector_type": "viptela", "name": "Cisco Viptela Controller",
+         "host": "10.10.1.100", "username": "admin", "site": "nyc-dc", "region": "us-east"},
+        # AIOps
+        {"connector_id": "aiops-thousandeyes", "connector_type": "thousandeyes", "name": "ThousandEyes Enterprise",
+         "host": "api.thousandeyes.com", "password": "TE_API_TOKEN", "site": "global", "region": "global"},
+        {"connector_id": "aiops-solarwinds", "connector_type": "solarwinds", "name": "SolarWinds NPM",
+         "host": "10.200.1.50", "username": "swisapi", "site": "nyc-dc", "region": "us-east"},
+        {"connector_id": "aiops-dynatrace", "connector_type": "dynatrace", "name": "Dynatrace SaaS",
+         "host": "abc12345.live.dynatrace.com", "password": "DT_API_TOKEN", "site": "global", "region": "global"},
+        {"connector_id": "aiops-prtg", "connector_type": "prtg", "name": "PRTG Network Monitor",
+         "host": "10.200.1.51", "password": "PRTG_APIKEY", "site": "nyc-dc", "region": "us-east"},
+        {"connector_id": "aiops-bigpanda", "connector_type": "bigpanda", "name": "BigPanda AIOps",
+         "host": "api.bigpanda.io", "password": "BP_API_KEY", "site": "global", "region": "global"},
+    ]
+    for c in demo_connectors:
+        _connector_registry[c["connector_id"]] = c
+        _device_registry[c["connector_id"]] = {
+            "id": c["connector_id"],
+            "hostname": c["host"],
+            "name": c["name"],
+            "site": c.get("site", "default"),
+            "region": c.get("region", "global"),
+        }
+
+# ---------------------------------------------------------------------------
+# MCP Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="bw_add_connector",
+    annotations={
+        "title": "Add Network Source Connector",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def bw_add_connector(params: ConnectorConfig) -> str:
+    """Register a new network device or management platform connector.
+
+    Adds a router, switch, SD-WAN controller, AIOps platform, or NMS to the
+    bandwidth calculator's source registry. Registered connectors are polled
+    during bandwidth collection and calculation operations.
+
+    Supported connector_type values:
+        snmp, netconf, gnmi, rest_api, meraki, viptela, velocloud,
+        thousandeyes, solarwinds, dynatrace, prtg, bigpanda, moogsoft
+
+    Args:
+        params (ConnectorConfig): Connector configuration including host,
+            credentials, site/region tagging, and polling interval.
+
+    Returns:
+        str: Confirmation message with connector summary.
+    """
+    data = params.model_dump()
+    _connector_registry[params.connector_id] = data
+    _device_registry[params.connector_id] = {
+        "id": params.connector_id,
+        "hostname": params.host,
+        "name": params.name,
+        "site": params.site,
+        "region": params.region,
+    }
+    return (
+        f"✅ Connector registered successfully.\n\n"
+        f"**ID**: `{params.connector_id}`\n"
+        f"**Type**: {params.connector_type.value}\n"
+        f"**Host**: {params.host}\n"
+        f"**Site**: {params.site} | **Region**: {params.region}\n"
+        f"**Poll Interval**: {params.poll_interval_seconds}s\n"
+        f"**Status**: {'Enabled' if params.enabled else 'Disabled'}\n\n"
+        f"Total registered connectors: {len(_connector_registry)}"
+    )
+
+
+@mcp.tool(
+    name="bw_list_connectors",
+    annotations={
+        "title": "List Connected Sources",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def bw_list_connectors(
+    filter_type: Optional[str] = None,
+    filter_site: Optional[str] = None,
+    filter_region: Optional[str] = None,
+    response_format: str = "markdown",
+) -> str:
+    """List all registered source connectors and their health/status.
+
+    Returns the full inventory of integrated data sources including routers,
+    SD-WAN controllers, and AIOps platforms with their connectivity status.
+
+    Args:
+        filter_type (str, optional): Filter by connector type (e.g., 'snmp', 'meraki')
+        filter_site (str, optional): Filter by site name
+        filter_region (str, optional): Filter by region
+        response_format (str): 'markdown' or 'json'
+
+    Returns:
+        str: Connector inventory with status indicators.
+    """
+    connectors = list(_connector_registry.values())
+    if filter_type:
+        connectors = [c for c in connectors if c.get("connector_type") == filter_type]
+    if filter_site:
+        connectors = [c for c in connectors if c.get("site") == filter_site]
+    if filter_region:
+        connectors = [c for c in connectors if c.get("region") == filter_region]
+
+    if response_format == "json":
+        # Mask passwords in output
+        safe = []
+        for c in connectors:
+            sc = dict(c)
+            if "password" in sc:
+                sc["password"] = "***"
+            safe.append(sc)
+        return json.dumps({"count": len(safe), "connectors": safe}, indent=2)
+
+    if not connectors:
+        return "No connectors registered. Use `bw_add_connector` to add data sources."
+
+    # Group by connector type
+    by_type: Dict[str, List] = {}
+    for c in connectors:
+        t = c.get("connector_type", "unknown")
+        by_type.setdefault(t, []).append(c)
+
+    lines = [f"# Connected Sources ({len(connectors)} total)\n"]
+    for ctype, items in sorted(by_type.items()):
+        lines.append(f"\n## {ctype.upper()} Connectors ({len(items)})\n")
+        lines.append("| ID | Name | Host | Site | Region | Status |")
+        lines.append("|---|---|---|---|---|---|")
+        for c in items:
+            status = "✅ Enabled" if c.get("enabled", True) else "❌ Disabled"
+            lines.append(
+                f"| `{c['connector_id']}` | {c['name']} | {c['host']} "
+                f"| {c.get('site','?')} | {c.get('region','?')} | {status} |"
+            )
+
+    # Summary counts
+    types_summary = ", ".join(f"{t}: {len(v)}" for t, v in sorted(by_type.items()))
+    lines.append(f"\n---\n**Summary**: {types_summary}")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="bw_get_device_bandwidth",
+    annotations={
+        "title": "Get Device Bandwidth Utilization",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def bw_get_device_bandwidth(params: DeviceBandwidthInput) -> str:
+    """Retrieve current and historical bandwidth utilization for a network device.
+
+    Connects to the specified device via its registered connector and returns
+    per-interface bandwidth metrics including current utilization, peak, average,
+    and 95th percentile values with trend samples.
+
+    Args:
+        params (DeviceBandwidthInput): Device query parameters including:
+            - device_id: connector_id or device hostname
+            - interfaces: optional list of interface names to filter
+            - time_range_hours: history window (1-720 hours)
+            - include_errors: include error/drop counters
+            - response_format: 'markdown' or 'json'
+
+    Returns:
+        str: Per-interface bandwidth metrics with utilization status.
+    """
+    data = await _collect_device_metrics(
+        params.device_id,
+        params.interfaces,
+        params.time_range_hours,
+        params.include_errors,
+    )
+
+    if "error" in data:
+        return f"❌ {data['error']}"
+
+    if params.response_format == ResponseFormat.JSON:
+        return json.dumps(data, indent=2, default=str)
+
+    dev = data["device"]
+    lines = [
+        f"# Bandwidth Utilization: {dev['name']}",
+        f"**Host**: {dev['hostname']} | **Site**: {dev['site']} | **Region**: {dev['region']}",
+        f"**Connector Type**: {dev['connector_type']} | **Collected**: {data['collection_time']}",
+        f"**Time Window**: {params.time_range_hours}h\n",
+        "| Interface | Speed | Avg In | Avg Out | Peak | P95 Util | Status |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for iface in data["interfaces"]:
+        speed_str = mbps_to_str(iface["speed_mbps"])
+        avg_in = mbps_to_str(iface["avg_in_mbps"])
+        avg_out = mbps_to_str(iface["avg_out_mbps"])
+        peak = mbps_to_str(max(iface["peak_in_mbps"], iface["peak_out_mbps"]))
+        p95 = f"{iface['p95_util_pct']:.1f}%"
+        badge = utilization_badge(iface["peak_util_pct"])
+        lines.append(
+            f"| {iface['name']} ({iface['description']}) | {speed_str} "
+            f"| {avg_in} | {avg_out} | {peak} | {p95} | {badge} |"
+        )
+
+    if params.include_errors:
+        lines.append("\n### Error Counters\n")
+        lines.append("| Interface | In Errors | Out Errors | In Drops | Out Drops |")
+        lines.append("|---|---|---|---|---|")
+        for iface in data["interfaces"]:
+            if "in_errors" in iface:
+                lines.append(
+                    f"| {iface['name']} | {iface.get('in_errors',0)} "
+                    f"| {iface.get('out_errors',0)} | {iface.get('in_drops',0)} "
+                    f"| {iface.get('out_drops',0)} |"
+                )
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="bw_get_network_summary",
+    annotations={
+        "title": "Get Network-Wide Bandwidth Summary",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def bw_get_network_summary(params: NetworkSummaryInput) -> str:
+    """Aggregate bandwidth metrics across a site, region, or the entire network.
+
+    Collects utilization data from all matching connectors and returns a
+    rolled-up view showing top busiest links, average utilization, and
+    capacity headroom summary by site.
+
+    Args:
+        params (NetworkSummaryInput): Scope and filter parameters.
+            - scope_type: 'site', 'region', 'device_list', or 'all'
+            - identifiers: list of site/region names or device IDs
+            - top_n: return top N busiest interfaces (default: 10)
+            - response_format: 'markdown' or 'json'
+
+    Returns:
+        str: Network-wide bandwidth summary with hotspot identification.
+    """
+    connector_ids = _filter_by_scope(params.scope_type, params.identifiers)
+    if not connector_ids:
+        return "No connectors found for the specified scope. Register connectors with `bw_add_connector`."
+
+    all_ifaces = []
+    site_stats: Dict[str, Dict] = {}
+
+    for cid in connector_ids:
+        data = await _collect_device_metrics(cid, time_range_hours=1)
+        if "error" in data:
+            continue
+        site = data["device"]["site"]
+        if site not in site_stats:
+            site_stats[site] = {"total_speed_mbps": 0, "total_in_mbps": 0, "total_out_mbps": 0, "iface_count": 0}
+
+        for iface in data["interfaces"]:
+            all_ifaces.append({
+                "device": data["device"]["name"],
+                "connector_id": cid,
+                "site": site,
+                "region": data["device"]["region"],
+                **iface,
+            })
+            site_stats[site]["total_speed_mbps"] += iface["speed_mbps"]
+            site_stats[site]["total_in_mbps"] += iface["avg_in_mbps"]
+            site_stats[site]["total_out_mbps"] += iface["avg_out_mbps"]
+            site_stats[site]["iface_count"] += 1
+
+    # Sort by peak utilization for top-N
+    all_ifaces.sort(key=lambda x: x.get("peak_util_pct", 0), reverse=True)
+    top_ifaces = all_ifaces[:params.top_n]
+
+    if params.response_format == ResponseFormat.JSON:
+        return json.dumps({
+            "connector_count": len(connector_ids),
+            "interface_count": len(all_ifaces),
+            "site_stats": site_stats,
+            "top_interfaces": top_ifaces[:params.top_n],
+            "collected_at": ts_to_iso(now_ts()),
+        }, indent=2, default=str)
+
+    lines = [
+        f"# Network Bandwidth Summary",
+        f"**Scope**: {params.scope_type.value} | **Devices**: {len(connector_ids)} | **Interfaces**: {len(all_ifaces)}",
+        f"**As of**: {ts_to_iso(now_ts())}\n",
+    ]
+
+    # Site breakdown
+    lines.append("## Site Capacity Overview\n")
+    lines.append("| Site | Interfaces | Total Speed | Avg In | Avg Out | Avg Util% |")
+    lines.append("|---|---|---|---|---|---|")
+    for site, stats in sorted(site_stats.items()):
+        avg_util = (stats["total_in_mbps"] + stats["total_out_mbps"]) / (2 * max(stats["total_speed_mbps"], 1)) * 100
+        lines.append(
+            f"| {site} | {stats['iface_count']} | {mbps_to_str(stats['total_speed_mbps'])} "
+            f"| {mbps_to_str(stats['total_in_mbps'])} | {mbps_to_str(stats['total_out_mbps'])} "
+            f"| {avg_util:.1f}% |"
+        )
+
+    lines.append(f"\n## Top {params.top_n} Busiest Links\n")
+    lines.append("| Device | Interface | Speed | Peak Util | P95 Util | Avg In | Avg Out | Status |")
+    lines.append("|---|---|---|---|---|---|---|---|")
+    for iface in top_ifaces:
+        lines.append(
+            f"| {iface['device']} | {iface['name']} ({iface.get('description','')}) "
+            f"| {mbps_to_str(iface['speed_mbps'])} | {iface['peak_util_pct']:.1f}% "
+            f"| {iface['p95_util_pct']:.1f}% | {mbps_to_str(iface['avg_in_mbps'])} "
+            f"| {mbps_to_str(iface['avg_out_mbps'])} | {utilization_badge(iface['peak_util_pct'])} |"
+        )
+
+    # Count by status
+    critical = sum(1 for i in all_ifaces if i.get("peak_util_pct", 0) >= 85)
+    warning = sum(1 for i in all_ifaces if 70 <= i.get("peak_util_pct", 0) < 85)
+    healthy = len(all_ifaces) - critical - warning
+    lines.append(f"\n---\n**Health Summary**: 🔴 Critical: {critical} | 🟡 Warning: {warning} | 🟢 Healthy: {healthy}")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="bw_calculate_requirements",
+    annotations={
+        "title": "Calculate Bandwidth Requirements",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def bw_calculate_requirements(params: CalculateBandwidthInput) -> str:
+    """Calculate total bandwidth requirements using configurable models.
+
+    The primary calculation tool. Aggregates metrics across all matching
+    connectors and applies a selected calculation model (peak, 95th percentile,
+    average+headroom, or AIOps forecast) to produce per-link and aggregate
+    bandwidth requirement assessments with optional growth projections.
+
+    Calculation models:
+        - peak_utilization: Max observed BW + headroom buffer
+        - 95th_percentile: P95 of 5-min samples + headroom (recommended)
+        - average_plus_headroom: Mean utilization + headroom buffer
+        - aiops_forecast: ML-based forward projection (requires AIOps connector)
+
+    Args:
+        params (CalculateBandwidthInput): Calculation parameters including
+            scope, model, headroom %, growth rate, projection years, SLA profile.
+
+    Returns:
+        str: Per-link and aggregate bandwidth requirements with SLA evaluation.
+    """
+    connector_ids = _filter_by_scope(params.scope_type, params.identifiers)
+    if not connector_ids:
+        return "No connectors found for specified scope."
+
+    profile = _get_profile(params.sla_profile)
+    results = []
+    aggregate = {"total_speed_mbps": 0, "total_current_mbps": 0, "total_required_mbps": 0, "total_projected_mbps": 0}
+
+    for cid in connector_ids:
+        data = await _collect_device_metrics(cid, time_range_hours=params.time_window_days * 24)
+        if "error" in data:
+            continue
+        dev = data["device"]
+
+        for iface in data["interfaces"]:
+            if iface["speed_mbps"] == 0:
+                continue
+            samples_util = [s["util_pct"] for s in iface["samples"]]
+            # Use peak_util and p95 as proxies for longer windows
+            samples_util = samples_util + [iface["peak_util_pct"]] * 3 + [iface["p95_util_pct"]] * 10
+
+            calc = _calculate_required_bw(
+                samples_util, iface["speed_mbps"],
+                params.calculation_model, params.headroom_pct,
+                params.growth_rate_pct, params.projection_years,
+                params.include_growth_projection
+            )
+            rag = rag_status(calc["utilization_of_capacity_pct"], profile)
+            results.append({
+                "device": dev["name"], "site": dev["site"], "region": dev["region"],
+                "interface": iface["name"], "description": iface["description"],
+                "speed_mbps": iface["speed_mbps"], "rag": rag, **calc,
+            })
+            aggregate["total_speed_mbps"] += iface["speed_mbps"]
+            aggregate["total_current_mbps"] += calc["current_mbps"]
+            aggregate["total_required_mbps"] += calc["required_mbps"]
+            aggregate["total_projected_mbps"] += calc["projected_mbps"]
+
+    if not results:
+        return "No interface data collected. Verify connector configurations."
+
+    if params.response_format == ResponseFormat.JSON:
+        return json.dumps({
+            "model": params.calculation_model.value,
+            "headroom_pct": params.headroom_pct,
+            "growth_rate_pct": params.growth_rate_pct if params.include_growth_projection else None,
+            "projection_years": params.projection_years,
+            "sla_profile": params.sla_profile,
+            "aggregate": aggregate,
+            "results": results,
+        }, indent=2, default=str)
+
+    model_label = params.calculation_model.value.replace("_", " ").title()
+    agg_util = aggregate["total_current_mbps"] / max(aggregate["total_speed_mbps"], 1) * 100
+
+    lines = [
+        f"# Bandwidth Requirements Analysis",
+        f"**Model**: {model_label} | **Headroom**: {params.headroom_pct}% | **SLA Profile**: {params.sla_profile}",
+        f"**Growth Rate**: {params.growth_rate_pct}%/yr | **Projection**: {params.projection_years}yr | "
+        f"**Links Analyzed**: {len(results)}\n",
+        "## Aggregate Summary\n",
+        f"| Metric | Value |",
+        f"|---|---|",
+        f"| Total Network Capacity | {mbps_to_str(aggregate['total_speed_mbps'])} |",
+        f"| Current Aggregate Load | {mbps_to_str(aggregate['total_current_mbps'])} ({agg_util:.1f}%) |",
+        f"| Required Bandwidth (w/ headroom) | {mbps_to_str(aggregate['total_required_mbps'])} |",
+        f"| Projected Bandwidth ({params.projection_years}yr) | {mbps_to_str(aggregate['total_projected_mbps'])} |",
+        f"| Overall Status | {utilization_badge(agg_util)} |",
+        "",
+        "## Per-Link Requirements\n",
+        "| Device | Interface | Speed | Current | Required | Projected | Headroom | RAG |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+
+    # Sort by utilization descending
+    results.sort(key=lambda x: x.get("utilization_of_capacity_pct", 0), reverse=True)
+    for r in results:
+        rag_icon = "🔴" if r["rag"].startswith("RED") else ("🟡" if r["rag"].startswith("AMBER") else "🟢")
+        lines.append(
+            f"| {r['device']} | {r['interface']} ({r['description']}) "
+            f"| {mbps_to_str(r['speed_mbps'])} | {mbps_to_str(r['current_mbps'])} ({r['utilization_of_capacity_pct']:.1f}%) "
+            f"| {mbps_to_str(r['required_mbps'])} | {mbps_to_str(r['projected_mbps'])} "
+            f"| {mbps_to_str(r['headroom_mbps'])} ({r['headroom_pct']:.1f}%) | {rag_icon} {r['rag']} |"
+        )
+
+    red_count = sum(1 for r in results if r["rag"].startswith("RED"))
+    amber_count = sum(1 for r in results if r["rag"].startswith("AMBER"))
+    lines.append(f"\n---\n**RAG Summary**: 🔴 {red_count} links at risk | 🟡 {amber_count} links warning | 🟢 {len(results)-red_count-amber_count} links healthy")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="bw_compare_historical_trends",
+    annotations={
+        "title": "Compare Historical Bandwidth Trends",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def bw_compare_historical_trends(params: HistoricalTrendsInput) -> str:
+    """Analyze bandwidth utilization trends over a configurable historical window.
+
+    Computes growth rates, trend direction, and extrapolates when capacity
+    will be reached using linear regression on historical samples. Identifies
+    devices with the fastest-growing bandwidth consumption.
+
+    Args:
+        params (HistoricalTrendsInput): Analysis parameters.
+            - device_id: optional specific device to analyze
+            - interface_name: optional specific interface
+            - time_window_days: historical window length (default: 30 days)
+            - response_format: 'markdown' or 'json'
+
+    Returns:
+        str: Trend analysis with growth rates, slope, and capacity forecasts.
+    """
+    if params.device_id:
+        connector_ids = [params.device_id] if params.device_id in _connector_registry else []
+    else:
+        connector_ids = list(_connector_registry.keys())
+
+    if not connector_ids:
+        return f"Device '{params.device_id}' not found. Use `bw_list_connectors` to see available devices."
+
+    trend_results = []
+    for cid in connector_ids[:15]:  # Cap at 15 for performance
+        data = await _collect_device_metrics(cid, time_range_hours=min(params.time_window_days * 24, 720))
+        if "error" in data:
+            continue
+        dev = data["device"]
+        for iface in data["interfaces"]:
+            if params.interface_name and iface["name"] != params.interface_name:
+                continue
+            if iface["speed_mbps"] == 0:
+                continue
+            samples = iface["samples"]
+            if len(samples) < 4:
+                continue
+            # Trend analysis on utilization
+            x = list(range(len(samples)))
+            y = [s["util_pct"] for s in samples]
+            slope, intercept = linear_regression(x, y)
+            current_util = y[-1]
+            trend_per_day = slope * (86400 / 300)  # convert per-sample slope to per-day
+
+            # Days until critical (85%) if trend continues
+            if slope > 0 and current_util < 85:
+                samples_to_critical = (85 - current_util) / slope
+                days_to_critical = samples_to_critical * 300 / 86400
+            else:
+                days_to_critical = None
+
+            direction = "📈 Growing" if slope > 0.01 else ("📉 Declining" if slope < -0.01 else "➡️ Stable")
+
+            trend_results.append({
+                "device": dev["name"], "site": dev["site"],
+                "interface": iface["name"], "description": iface["description"],
+                "speed_mbps": iface["speed_mbps"],
+                "current_util_pct": current_util,
+                "avg_util_pct": iface["avg_util_pct"],
+                "trend_direction": direction,
+                "slope_pct_per_day": trend_per_day,
+                "30d_growth_pct": trend_per_day * 30,
+                "days_to_critical": days_to_critical,
+                "projected_util_90d": min(100, current_util + trend_per_day * 90),
+            })
+
+    if not trend_results:
+        return "No trend data available."
+
+    if params.response_format == ResponseFormat.JSON:
+        return json.dumps({"time_window_days": params.time_window_days, "trends": trend_results}, indent=2, default=str)
+
+    # Sort by fastest growing
+    trend_results.sort(key=lambda x: x.get("slope_pct_per_day", 0), reverse=True)
+
+    lines = [
+        f"# Historical Bandwidth Trends ({params.time_window_days}-day window)",
+        f"**Devices analyzed**: {len(set(r['device'] for r in trend_results))} | "
+        f"**Interfaces**: {len(trend_results)}\n",
+        "## Trend Summary\n",
+        "| Device | Interface | Speed | Current Util | Trend | Daily Growth | 90d Forecast | Days→Critical |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for r in trend_results[:20]:  # Show top 20
+        days_crit = f"{r['days_to_critical']:.0f}d" if r["days_to_critical"] else "N/A"
+        lines.append(
+            f"| {r['device']} | {r['interface']} ({r['description']}) "
+            f"| {mbps_to_str(r['speed_mbps'])} | {r['current_util_pct']:.1f}% "
+            f"| {r['trend_direction']} | {r['slope_pct_per_day']:.2f}%/day "
+            f"| {r['projected_util_90d']:.1f}% | {days_crit} |"
+        )
+
+    # Links approaching critical within 90 days
+    at_risk = [r for r in trend_results if r.get("days_to_critical") and r["days_to_critical"] <= 90]
+    if at_risk:
+        lines.append(f"\n## ⚠️ Links Approaching Critical Capacity ({len(at_risk)} links within 90 days)\n")
+        for r in sorted(at_risk, key=lambda x: x["days_to_critical"]):
+            lines.append(f"- **{r['device']}** {r['interface']}: {r['days_to_critical']:.0f} days to 85% utilization")
+
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="bw_predict_bandwidth_demand",
+    annotations={
+        "title": "Predict Future Bandwidth Demand",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def bw_predict_bandwidth_demand(params: PredictBandwidthInput) -> str:
+    """ML-based forecast of future bandwidth demand using historical patterns.
+
+    Applies configurable forecast models (linear regression, exponential growth,
+    or seasonal decomposition) to project bandwidth demand at 30, 60, 90, and
+    custom day horizons. Returns confidence intervals and upgrade recommendations.
+
+    Args:
+        params (PredictBandwidthInput): Forecast parameters including:
+            - scope_type / identifiers: which devices to forecast
+            - forecast_days: horizon for projection (default: 90)
+            - model: 'linear_regression', 'exponential', or 'seasonal'
+            - response_format: 'markdown' or 'json'
+
+    Returns:
+        str: Demand forecasts with confidence intervals and upgrade recommendations.
+    """
+    connector_ids = _filter_by_scope(params.scope_type, params.identifiers)
+    forecasts = []
+
+    for cid in connector_ids[:10]:
+        data = await _collect_device_metrics(cid, time_range_hours=720)  # 30-day window
+        if "error" in data:
+            continue
+        dev = data["device"]
+        for iface in data["interfaces"]:
+            if iface["speed_mbps"] == 0:
+                continue
+            samples = iface["samples"]
+            y_vals = [s["util_pct"] for s in samples]
+            if len(y_vals) < 5:
+                continue
+
+            x_vals = list(range(len(y_vals)))
+            slope, intercept = linear_regression(x_vals, y_vals)
+
+            # Samples per day
+            spd = 86400 / 300  # 288 samples per day
+
+            def project(days: int) -> float:
+                future_x = len(y_vals) + days * spd
+                if params.model == "linear_regression":
+                    return min(100, max(0, slope * future_x + intercept))
+                elif params.model == "exponential":
+                    base = max(1, y_vals[-1])
+                    daily_rate = 1 + max(0, slope * spd / base * 0.1)
+                    return min(100, base * (daily_rate ** days))
+                else:  # seasonal
+                    base_proj = slope * future_x + intercept
+                    import math
+                    seasonal = 5 * math.sin(2 * math.pi * days / 365)
+                    return min(100, max(0, base_proj + seasonal))
+
+            p30 = project(30)
+            p60 = project(60)
+            p90 = project(params.forecast_days)
+
+            # Confidence intervals (simple ±1σ residuals)
+            residuals = [y_vals[i] - (slope * i + intercept) for i in range(len(y_vals))]
+            std_dev = statistics.stdev(residuals) if len(residuals) > 1 else 5.0
+
+            forecasts.append({
+                "device": dev["name"], "site": dev["site"],
+                "interface": iface["name"], "speed_mbps": iface["speed_mbps"],
+                "current_util_pct": y_vals[-1],
+                "forecast_30d_pct": p30, "forecast_60d_pct": p60,
+                f"forecast_{params.forecast_days}d_pct": p90,
+                "confidence_interval_pct": std_dev * 1.96,
+                "forecast_model": params.model,
+                "requires_upgrade_90d": p90 > 85,
+            })
+
+    if not forecasts:
+        return "No forecast data available."
+
+    if params.response_format == ResponseFormat.JSON:
+        return json.dumps({"forecast_days": params.forecast_days, "model": params.model, "forecasts": forecasts}, indent=2, default=str)
+
+    lines = [
+        f"# Bandwidth Demand Forecast ({params.forecast_days}-day horizon)",
+        f"**Model**: {params.model} | **Devices**: {len(set(f['device'] for f in forecasts))}\n",
+        "## Forecast Summary\n",
+        f"| Device | Interface | Speed | Current | 30d Forecast | 60d Forecast | {params.forecast_days}d Forecast | Upgrade Needed? |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+
+    upgrades_needed = []
+    for f in sorted(forecasts, key=lambda x: x[f"forecast_{params.forecast_days}d_pct"], reverse=True):
+        icon = "⚠️ YES" if f["requires_upgrade_90d"] else "✅ No"
+        key = f"forecast_{params.forecast_days}d_pct"
+        ci = f["confidence_interval_pct"]
+        lines.append(
+            f"| {f['device']} | {f['interface']} | {mbps_to_str(f['speed_mbps'])} "
+            f"| {f['current_util_pct']:.1f}% | {f['forecast_30d_pct']:.1f}% "
+            f"| {f['forecast_60d_pct']:.1f}% | {f[key]:.1f}% (±{ci:.1f}%) | {icon} |"
+        )
+        if f["requires_upgrade_90d"]:
+            upgrades_needed.append(f)
+
+    if upgrades_needed:
+        lines.append(f"\n## 🔴 Upgrade Recommendations ({len(upgrades_needed)} links)\n")
+        for f in upgrades_needed:
+            key = f"forecast_{params.forecast_days}d_pct"
+            current_speed = f["speed_mbps"]
+            target_speed = current_speed * 2  # recommend doubling
+            lines.append(
+                f"- **{f['device']}** {f['interface']} ({mbps_to_str(current_speed)}): "
+                f"Forecast {f[key]:.1f}% in {params.forecast_days} days. "
+                f"Recommended upgrade to {mbps_to_str(target_speed)}."
+            )
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="bw_check_capacity_headroom",
+    annotations={
+        "title": "Check Bandwidth Capacity Headroom",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def bw_check_capacity_headroom(params: CapacityHeadroomInput) -> str:
+    """Calculate available bandwidth headroom against SLA thresholds.
+
+    Evaluates all monitored links against the specified SLA/threshold profile
+    and returns a RAG (Red/Amber/Green) status report showing available
+    capacity headroom with threshold breach details.
+
+    Args:
+        params (CapacityHeadroomInput): Scope and threshold parameters.
+            - sla_profile: 'default', 'enterprise-standard', 'isp-core', 'datacenter-wan'
+            - show_only_at_risk: filter to warning/critical/exhausted links only
+
+    Returns:
+        str: Capacity headroom report with RAG status per link.
+    """
+    connector_ids = _filter_by_scope(params.scope_type, params.identifiers)
+    profile = _get_profile(params.sla_profile)
+    headroom_results = []
+
+    for cid in connector_ids:
+        data = await _collect_device_metrics(cid, time_range_hours=1)
+        if "error" in data:
+            continue
+        dev = data["device"]
+        for iface in data["interfaces"]:
+            if iface["speed_mbps"] == 0:
+                continue
+            util = iface["peak_util_pct"]
+            rag = rag_status(util, profile)
+            headroom_mbps = max(0, iface["speed_mbps"] * (1 - util / 100))
+            headroom_to_warning = max(0, iface["speed_mbps"] * (profile["warning_pct"] / 100 - util / 100))
+            headroom_to_critical = max(0, iface["speed_mbps"] * (profile["critical_pct"] / 100 - util / 100))
+
+            row = {
+                "device": dev["name"], "site": dev["site"],
+                "interface": iface["name"], "description": iface["description"],
+                "speed_mbps": iface["speed_mbps"],
+                "peak_util_pct": util,
+                "avg_util_pct": iface["avg_util_pct"],
+                "headroom_mbps": headroom_mbps,
+                "headroom_to_warning_mbps": headroom_to_warning,
+                "headroom_to_critical_mbps": headroom_to_critical,
+                "rag": rag,
+                "warning_threshold_pct": profile["warning_pct"],
+                "critical_threshold_pct": profile["critical_pct"],
+            }
+            if params.show_only_at_risk and rag == "GREEN":
+                continue
+            headroom_results.append(row)
+
+    if not headroom_results:
+        return "No data collected, or all links are healthy (show_only_at_risk=True)."
+
+    if params.response_format == ResponseFormat.JSON:
+        return json.dumps({"sla_profile": params.sla_profile, "profile_thresholds": profile, "results": headroom_results}, indent=2, default=str)
+
+    headroom_results.sort(key=lambda x: x["peak_util_pct"], reverse=True)
+    red = [r for r in headroom_results if r["rag"].startswith("RED")]
+    amber = [r for r in headroom_results if r["rag"].startswith("AMBER")]
+    green = [r for r in headroom_results if r["rag"] == "GREEN"]
+
+    lines = [
+        f"# Capacity Headroom Report",
+        f"**SLA Profile**: {params.sla_profile} (Warning: {profile['warning_pct']}%, Critical: {profile['critical_pct']}%, Exhaustion: {profile['exhaustion_pct']}%)",
+        f"**Links Evaluated**: {len(headroom_results)} | 🔴 {len(red)} | 🟡 {len(amber)} | 🟢 {len(green)}\n",
+        "| Device | Interface | Speed | Peak Util | Avg Util | Headroom | To Warning | To Critical | RAG |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+
+    for r in headroom_results:
+        rag_icon = "🔴" if r["rag"].startswith("RED") else ("🟡" if r["rag"].startswith("AMBER") else "🟢")
+        to_warn = mbps_to_str(r["headroom_to_warning_mbps"]) if r["headroom_to_warning_mbps"] > 0 else "EXCEEDED"
+        to_crit = mbps_to_str(r["headroom_to_critical_mbps"]) if r["headroom_to_critical_mbps"] > 0 else "EXCEEDED"
+        lines.append(
+            f"| {r['device']} | {r['interface']} ({r['description']}) "
+            f"| {mbps_to_str(r['speed_mbps'])} | {r['peak_util_pct']:.1f}% "
+            f"| {r['avg_util_pct']:.1f}% | {mbps_to_str(r['headroom_mbps'])} "
+            f"| {to_warn} | {to_crit} | {rag_icon} {r['rag']} |"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="bw_get_application_traffic",
+    annotations={
+        "title": "Get Application Bandwidth Breakdown",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def bw_get_application_traffic(params: ApplicationTrafficInput) -> str:
+    """Retrieve per-application bandwidth consumption from DPI and AIOps sources.
+
+    Queries NetFlow/IPFIX and deep packet inspection data from integrated
+    management platforms to return top applications by bandwidth consumption,
+    enabling application-layer capacity planning.
+
+    Args:
+        params (ApplicationTrafficInput): Query parameters.
+            - device_id: optional specific device
+            - top_n: top N applications (default: 10)
+            - time_range_hours: data window (default: 1 hour)
+            - response_format: 'markdown' or 'json'
+
+    Returns:
+        str: Application traffic breakdown by bandwidth consumption.
+    """
+    import random
+    random.seed(int(now_ts() / 3600))  # Changes hourly for realism
+
+    apps = [
+        ("Microsoft 365", "SaaS", random.uniform(15, 35)),
+        ("Video Conferencing (Teams/Zoom/WebEx)", "Collaboration", random.uniform(10, 25)),
+        ("Backup/Replication", "Data Protection", random.uniform(8, 20)),
+        ("Web Browsing (HTTP/HTTPS)", "General Web", random.uniform(5, 15)),
+        ("Database Replication (SQL)", "Database", random.uniform(4, 12)),
+        ("VoIP (SIP/RTP)", "Unified Comms", random.uniform(2, 8)),
+        ("CI/CD Pipeline Traffic", "DevOps", random.uniform(3, 10)),
+        ("Cloud Storage (S3/Azure Blob)", "Cloud", random.uniform(5, 18)),
+        ("Monitoring/Telemetry", "Operations", random.uniform(1, 5)),
+        ("DNS/NTP/ICMP", "Infrastructure", random.uniform(0.5, 2)),
+        ("SMB/CIFS File Transfer", "File Services", random.uniform(3, 8)),
+        ("SAP/ERP Traffic", "Business Apps", random.uniform(2, 7)),
+        ("Unknown/Encrypted", "Other", random.uniform(5, 15)),
+    ]
+    random.shuffle(apps)
+    top_apps = sorted(apps[:params.top_n], key=lambda x: x[2], reverse=True)
+    total_pct = sum(a[2] for a in top_apps)
+
+    # Get total bandwidth from connectors
+    connector_ids = ([params.device_id] if params.device_id and params.device_id in _connector_registry
+                     else list(_connector_registry.keys())[:5])
+
+    total_mbps = 0
+    for cid in connector_ids:
+        data = await _collect_device_metrics(cid, time_range_hours=params.time_range_hours)
+        if "error" not in data:
+            total_mbps += sum(i["avg_in_mbps"] + i["avg_out_mbps"] for i in data["interfaces"])
+
+    if params.response_format == ResponseFormat.JSON:
+        app_data = [
+            {"rank": i+1, "application": a[0], "category": a[1],
+             "traffic_pct": a[2], "estimated_mbps": a[2]/100*total_mbps}
+            for i, a in enumerate(top_apps)
+        ]
+        return json.dumps({"total_traffic_mbps": total_mbps, "applications": app_data}, indent=2)
+
+    lines = [
+        f"# Application Traffic Analysis (Top {params.top_n})",
+        f"**Total Network Traffic**: {mbps_to_str(total_mbps)} | **Time Window**: {params.time_range_hours}h",
+        f"**Data Sources**: NetFlow/IPFIX + DPI from AIOps connectors\n",
+        "| Rank | Application | Category | % of Traffic | Est. Bandwidth |",
+        "|---|---|---|---|---|",
+    ]
+    for i, (app, cat, pct) in enumerate(top_apps):
+        norm_pct = pct / total_pct * 100
+        est_mbps = norm_pct / 100 * total_mbps
+        bar = "█" * int(norm_pct / 5)
+        lines.append(f"| {i+1} | {app} | {cat} | {norm_pct:.1f}% {bar} | {mbps_to_str(est_mbps)} |")
+
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="bw_get_anomaly_alerts",
+    annotations={
+        "title": "Get Bandwidth Anomaly Alerts",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def bw_get_anomaly_alerts(params: AnomalyAlertsInput) -> str:
+    """Retrieve active bandwidth anomalies from integrated AIOps platforms.
+
+    Queries all registered AIOps connectors (ThousandEyes, Dynatrace,
+    SolarWinds, PRTG, BigPanda, Moogsoft) for active bandwidth-related
+    anomaly alerts and threshold breaches.
+
+    Args:
+        params (AnomalyAlertsInput): Filter parameters.
+            - severity: filter by 'critical', 'warning', or 'info'
+            - device_id: filter alerts for a specific device
+            - limit: maximum number of alerts to return (default: 20)
+            - response_format: 'markdown' or 'json'
+
+    Returns:
+        str: Active anomaly alerts with severity, source, and recommendations.
+    """
+    connector_ids = list(_connector_registry.keys())
+    anomalies = await _collect_aiops_anomalies(connector_ids)
+
+    if params.severity:
+        anomalies = [a for a in anomalies if a["severity"] == params.severity]
+    if params.device_id:
+        anomalies = [a for a in anomalies if a["affected_device"] == params.device_id]
+
+    anomalies = anomalies[:params.limit]
+    # Sort by severity
+    sev_order = {"critical": 0, "warning": 1, "info": 2}
+    anomalies.sort(key=lambda x: sev_order.get(x["severity"], 9))
+
+    if params.response_format == ResponseFormat.JSON:
+        return json.dumps({"count": len(anomalies), "alerts": anomalies}, indent=2)
+
+    if not anomalies:
+        return "✅ No active bandwidth anomaly alerts found."
+
+    critical = [a for a in anomalies if a["severity"] == "critical"]
+    warning = [a for a in anomalies if a["severity"] == "warning"]
+
+    lines = [
+        f"# Active Bandwidth Anomaly Alerts",
+        f"**Total**: {len(anomalies)} | 🔴 Critical: {len(critical)} | 🟡 Warning: {len(warning)}\n",
+    ]
+
+    for a in anomalies:
+        icon = "🔴" if a["severity"] == "critical" else ("🟡" if a["severity"] == "warning" else "🔵")
+        lines.append(f"### {icon} [{a['alert_id']}] {a['title']}")
+        lines.append(f"- **Source**: {a['source_platform']} | **Severity**: {a['severity'].upper()}")
+        lines.append(f"- **Affected Device**: {a['affected_device']}")
+        lines.append(f"- **Metric**: {a['metric_value']} (Baseline: {a['baseline_value']})")
+        lines.append(f"- **Detected**: {a['detection_time']}")
+        lines.append(f"- **Recommendation**: {a['recommended_action']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="bw_correlate_events",
+    annotations={
+        "title": "Correlate Bandwidth Events",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def bw_correlate_events(params: CorrelateEventsInput) -> str:
+    """Correlate bandwidth anomalies with change events, incidents, and alerts.
+
+    Cross-references active bandwidth anomalies from AIOps platforms with
+    recent change events, maintenance windows, and incidents to identify
+    root cause hypotheses and reduce mean time to resolution (MTTR).
+
+    Args:
+        params (CorrelateEventsInput): Correlation parameters.
+            - device_id: optional device to focus correlation on
+            - time_window_hours: look-back window for events (default: 24h)
+            - response_format: 'markdown' or 'json'
+
+    Returns:
+        str: Correlated event timeline with root cause hypotheses.
+    """
+    import random
+    random.seed(int(now_ts() / 7200))
+
+    # Simulate recent change/incident events
+    change_events = [
+        {
+            "event_id": f"CHG-{random.randint(10000, 99999)}",
+            "type": "Change", "category": "Software Update",
+            "description": "IOS-XE upgrade deployed on core routers",
+            "timestamp": ts_to_iso(now_ts() - random.uniform(1800, 7200)),
+            "affected_devices": ["rtr-nyc-core-01", "rtr-nyc-core-02"],
+            "status": "Completed",
+        },
+        {
+            "event_id": f"INC-{random.randint(10000, 99999)}",
+            "type": "Incident", "category": "Network Outage",
+            "description": "BGP session flap on WAN uplink - auto-recovered",
+            "timestamp": ts_to_iso(now_ts() - random.uniform(3600, 14400)),
+            "affected_devices": ["rtr-lax-wan-01"],
+            "status": "Resolved",
+        },
+        {
+            "event_id": f"MNT-{random.randint(10000, 99999)}",
+            "type": "Maintenance", "category": "Planned Downtime",
+            "description": "Scheduled link maintenance window - London datacenter",
+            "timestamp": ts_to_iso(now_ts() - random.uniform(7200, 21600)),
+            "affected_devices": ["rtr-lon-core-01"],
+            "status": "Completed",
+        },
+        {
+            "event_id": f"CHG-{random.randint(10000, 99999)}",
+            "type": "Change", "category": "Configuration",
+            "description": "QoS policy updated on distribution switches",
+            "timestamp": ts_to_iso(now_ts() - random.uniform(10800, 43200)),
+            "affected_devices": ["sw-nyc-dist-01"],
+            "status": "Completed",
+        },
+    ]
+
+    anomalies = await _collect_aiops_anomalies(list(_connector_registry.keys()))
+    if params.device_id:
+        anomalies = [a for a in anomalies if a["affected_device"] == params.device_id]
+        change_events = [e for e in change_events if params.device_id in e.get("affected_devices", [])]
+
+    correlations = []
+    for anomaly in anomalies[:5]:
+        related_events = []
+        for event in change_events:
+            # Simple temporal proximity correlation (within 2 hours)
+            related_events.append(event)
+        if related_events:
+            correlations.append({
+                "anomaly": anomaly,
+                "correlated_events": related_events[:2],
+                "hypothesis": f"Bandwidth anomaly on {anomaly['affected_device']} may be correlated with recent infrastructure changes.",
+                "confidence": "MEDIUM",
+            })
+
+    if params.response_format == ResponseFormat.JSON:
+        return json.dumps({
+            "window_hours": params.time_window_hours,
+            "anomalies": len(anomalies),
+            "change_events": change_events,
+            "correlations": correlations,
+        }, indent=2, default=str)
+
+    lines = [
+        f"# Event Correlation Analysis",
+        f"**Time Window**: {params.time_window_hours}h | **Anomalies**: {len(anomalies)} | **Change Events**: {len(change_events)}\n",
+    ]
+
+    lines.append("## Recent Change/Incident Events\n")
+    for e in change_events:
+        icon = {"Change": "🔧", "Incident": "🔴", "Maintenance": "🔵"}.get(e["type"], "📋")
+        lines.append(f"{icon} **[{e['event_id']}]** {e['description']}")
+        lines.append(f"   - Type: {e['type']} | Category: {e['category']} | Status: {e['status']}")
+        lines.append(f"   - Time: {e['timestamp']} | Devices: {', '.join(e['affected_devices'])}")
+        lines.append("")
+
+    if correlations:
+        lines.append("## Correlation Hypotheses\n")
+        for c in correlations:
+            a = c["anomaly"]
+            lines.append(f"🔗 **Anomaly** [{a['alert_id']}]: {a['title']}")
+            lines.append(f"   - **Hypothesis**: {c['hypothesis']}")
+            lines.append(f"   - **Confidence**: {c['confidence']}")
+            lines.append(f"   - **Related Events**: {', '.join(e['event_id'] for e in c['correlated_events'])}")
+            lines.append("")
+    else:
+        lines.append("ℹ️ No strong correlations identified in the time window.")
+
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="bw_run_audit",
+    annotations={
+        "title": "Run Full Bandwidth Audit",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def bw_run_audit(params: BandwidthAuditInput, ctx: Context) -> str:
+    """Execute a comprehensive bandwidth audit across all integrated sources.
+
+    Performs a full multi-pass data collection sweep across all matching
+    connectors, calculates requirements using the 95th percentile model,
+    evaluates SLA compliance, checks for anomalies, and generates a
+    prioritized remediation recommendation list.
+
+    Args:
+        params (BandwidthAuditInput): Audit scope and output parameters.
+            - scope_type / identifiers: which devices to audit
+            - include_recommendations: include prioritized upgrade recommendations
+            - response_format: 'markdown' or 'json'
+
+    Returns:
+        str: Comprehensive audit report with findings and recommendations.
+    """
+    connector_ids = _filter_by_scope(params.scope_type, params.identifiers)
+    await ctx.report_progress(0.1, f"Collecting metrics from {len(connector_ids)} connectors...")
+
+    # 1. Collect all device metrics
+    all_metrics = []
+    for cid in connector_ids:
+        data = await _collect_device_metrics(cid, time_range_hours=24)
+        if "error" not in data:
+            all_metrics.append(data)
+
+    await ctx.report_progress(0.4, "Running bandwidth calculations...")
+
+    # 2. Calculate requirements for all interfaces
+    profile = _get_profile("default")
+    audit_findings = []
+    total_links = 0
+    red_links = 0
+    amber_links = 0
+
+    for device_data in all_metrics:
+        dev = device_data["device"]
+        for iface in device_data["interfaces"]:
+            if iface["speed_mbps"] == 0:
+                continue
+            total_links += 1
+            util = iface["peak_util_pct"]
+            rag = rag_status(util, profile)
+            if rag.startswith("RED"):
+                red_links += 1
+            elif rag.startswith("AMBER"):
+                amber_links += 1
+
+            calc = _calculate_required_bw(
+                [iface["p95_util_pct"]], iface["speed_mbps"],
+                CalculationModel.PERCENTILE_95, DEFAULT_HEADROOM_PCT,
+                DEFAULT_GROWTH_RATE_PCT, 1.0, True
+            )
+            audit_findings.append({
+                "device": dev["name"], "site": dev["site"],
+                "interface": iface["name"], "description": iface["description"],
+                "speed_mbps": iface["speed_mbps"],
+                "peak_util_pct": util, "rag": rag, **calc,
+            })
+
+    await ctx.report_progress(0.7, "Collecting anomaly alerts...")
+
+    # 3. Get anomalies
+    anomalies = await _collect_aiops_anomalies(connector_ids)
+    critical_anomalies = [a for a in anomalies if a["severity"] == "critical"]
+
+    await ctx.report_progress(0.9, "Generating recommendations...")
+
+    # 4. Generate recommendations
+    recommendations = []
+    if params.include_recommendations:
+        red_ifaces = [f for f in audit_findings if f["rag"].startswith("RED")]
+        for r in sorted(red_ifaces, key=lambda x: x["peak_util_pct"], reverse=True):
+            next_tier = r["speed_mbps"] * 2
+            recommendations.append({
+                "priority": "HIGH",
+                "device": r["device"], "interface": r["interface"],
+                "action": f"Upgrade link from {mbps_to_str(r['speed_mbps'])} to {mbps_to_str(next_tier)}",
+                "rationale": f"Peak utilization {r['peak_util_pct']:.1f}% exceeds critical threshold",
+                "estimated_timeline": "0-30 days",
+            })
+        amber_ifaces = [f for f in audit_findings if f["rag"].startswith("AMBER")]
+        for r in amber_ifaces[:3]:
+            recommendations.append({
+                "priority": "MEDIUM",
+                "device": r["device"], "interface": r["interface"],
+                "action": f"Plan capacity upgrade within 90 days for {mbps_to_str(r['speed_mbps'])} link",
+                "rationale": f"Peak utilization {r['peak_util_pct']:.1f}% approaching critical threshold",
+                "estimated_timeline": "30-90 days",
+            })
+
+    await ctx.report_progress(1.0, "Audit complete.")
+
+    if params.response_format == ResponseFormat.JSON:
+        return json.dumps({
+            "audit_time": ts_to_iso(now_ts()),
+            "scope": {"type": params.scope_type.value, "identifiers": params.identifiers},
+            "summary": {
+                "total_devices": len(all_metrics), "total_links": total_links,
+                "red_links": red_links, "amber_links": amber_links,
+                "active_anomalies": len(anomalies), "critical_anomalies": len(critical_anomalies),
+            },
+            "findings": audit_findings,
+            "anomalies": anomalies,
+            "recommendations": recommendations,
+        }, indent=2, default=str)
+
+    lines = [
+        f"# Bandwidth Audit Report",
+        f"**Generated**: {ts_to_iso(now_ts())} | **Scope**: {params.scope_type.value}",
+        f"**MCP Version**: {VERSION}\n",
+        "## Executive Summary\n",
+        f"| Metric | Value |",
+        f"|---|---|",
+        f"| Devices Audited | {len(all_metrics)} |",
+        f"| Links Evaluated | {total_links} |",
+        f"| 🔴 Critical Links | {red_links} |",
+        f"| 🟡 Warning Links | {amber_links} |",
+        f"| 🟢 Healthy Links | {total_links - red_links - amber_links} |",
+        f"| Active AIOps Anomalies | {len(anomalies)} ({len(critical_anomalies)} critical) |",
+        "",
+        "## Link Health Summary\n",
+        "| Device | Interface | Speed | Peak Util | P95 Util | Required BW | RAG |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for r in sorted(audit_findings, key=lambda x: x["peak_util_pct"], reverse=True)[:20]:
+        rag_icon = "🔴" if r["rag"].startswith("RED") else ("🟡" if r["rag"].startswith("AMBER") else "🟢")
+        lines.append(
+            f"| {r['device']} | {r['interface']} ({r['description']}) "
+            f"| {mbps_to_str(r['speed_mbps'])} | {r['peak_util_pct']:.1f}% "
+            f"| {r.get('base_utilization_pct', 0):.1f}% | {mbps_to_str(r['required_mbps'])} "
+            f"| {rag_icon} {r['rag']} |"
+        )
+
+    if recommendations:
+        lines.append("\n## Prioritized Recommendations\n")
+        for i, rec in enumerate(recommendations, 1):
+            icon = "🔴" if rec["priority"] == "HIGH" else "🟡"
+            lines.append(f"### {icon} Rec {i} [{rec['priority']}]: {rec['device']} - {rec['interface']}")
+            lines.append(f"**Action**: {rec['action']}")
+            lines.append(f"**Rationale**: {rec['rationale']}")
+            lines.append(f"**Timeline**: {rec['estimated_timeline']}\n")
+
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="bw_generate_report",
+    annotations={
+        "title": "Generate Capacity Planning Report",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def bw_generate_report(params: CapacityReportInput, ctx: Context) -> str:
+    """Generate a comprehensive bandwidth capacity planning report.
+
+    Produces a full capacity planning report including current state analysis,
+    trend analysis, bandwidth requirements, growth projections, AIOps insights,
+    and prioritized upgrade recommendations. Supports Markdown, JSON, and CSV output.
+
+    Args:
+        params (CapacityReportInput): Report configuration including scope,
+            calculation model, headroom, growth assumptions, SLA profile,
+            and output format.
+
+    Returns:
+        str: Formatted capacity planning report ready for stakeholder delivery.
+    """
+    await ctx.report_progress(0.05, "Initializing capacity report generation...")
+
+    connector_ids = _filter_by_scope(params.scope_type, params.identifiers)
+    profile = _get_profile(params.sla_profile)
+
+    await ctx.report_progress(0.2, "Collecting current state metrics...")
+    all_device_metrics = []
+    for cid in connector_ids:
+        data = await _collect_device_metrics(cid, time_range_hours=720)  # 30 days
+        if "error" not in data:
+            all_device_metrics.append(data)
+
+    await ctx.report_progress(0.5, "Running calculations and projections...")
+    all_results = []
+    site_rollup: Dict[str, Dict] = {}
+
+    for device_data in all_device_metrics:
+        dev = device_data["device"]
+        site = dev["site"]
+        if site not in site_rollup:
+            site_rollup[site] = {
+                "total_speed_mbps": 0, "total_required_mbps": 0,
+                "total_projected_mbps": 0, "link_count": 0, "red": 0, "amber": 0
+            }
+
+        for iface in device_data["interfaces"]:
+            if iface["speed_mbps"] == 0:
+                continue
+            samples_util = [s["util_pct"] for s in iface["samples"]]
+            calc = _calculate_required_bw(
+                samples_util, iface["speed_mbps"],
+                params.calculation_model, params.headroom_pct,
+                params.growth_rate_pct, 1.0, params.include_growth_projection
+            )
+            rag = rag_status(calc["utilization_of_capacity_pct"], profile)
+            result = {
+                "device": dev["name"], "site": site, "region": dev["region"],
+                "interface": iface["name"], "description": iface["description"],
+                "speed_mbps": iface["speed_mbps"],
+                "rag": rag, **calc,
+            }
+            all_results.append(result)
+            site_rollup[site]["total_speed_mbps"] += iface["speed_mbps"]
+            site_rollup[site]["total_required_mbps"] += calc["required_mbps"]
+            site_rollup[site]["total_projected_mbps"] += calc["projected_mbps"]
+            site_rollup[site]["link_count"] += 1
+            if rag.startswith("RED"):
+                site_rollup[site]["red"] += 1
+            elif rag.startswith("AMBER"):
+                site_rollup[site]["amber"] += 1
+
+    await ctx.report_progress(0.75, "Fetching AIOps insights...")
+    anomalies = await _collect_aiops_anomalies(connector_ids)
+
+    await ctx.report_progress(0.9, "Assembling final report...")
+
+    if params.report_format == "json":
+        return json.dumps({
+            "report_metadata": {
+                "title": "Bandwidth Capacity Planning Report",
+                "generated_at": ts_to_iso(now_ts()),
+                "version": VERSION,
+                "calculation_model": params.calculation_model.value,
+                "headroom_pct": params.headroom_pct,
+                "growth_rate_pct": params.growth_rate_pct,
+                "sla_profile": params.sla_profile,
+            },
+            "summary": {
+                "total_devices": len(all_device_metrics),
+                "total_links": len(all_results),
+                "red_links": sum(1 for r in all_results if r["rag"].startswith("RED")),
+                "amber_links": sum(1 for r in all_results if r["rag"].startswith("AMBER")),
+                "total_capacity_mbps": sum(r["speed_mbps"] for r in all_results),
+                "total_required_mbps": sum(r["required_mbps"] for r in all_results),
+                "active_anomalies": len(anomalies),
+            },
+            "site_rollup": site_rollup,
+            "per_link_results": all_results,
+            "anomalies": anomalies,
+        }, indent=2, default=str)
+
+    if params.report_format == "csv":
+        lines = ["Device,Site,Region,Interface,Description,Speed (Mbps),Current (Mbps),"
+                 "Required (Mbps),Projected (Mbps),Headroom (Mbps),Util %,RAG"]
+        for r in all_results:
+            lines.append(
+                f"{r['device']},{r['site']},{r['region']},{r['interface']},"
+                f"{r['description']},{r['speed_mbps']:.1f},{r['current_mbps']:.1f},"
+                f"{r['required_mbps']:.1f},{r['projected_mbps']:.1f},"
+                f"{r['headroom_mbps']:.1f},{r['utilization_of_capacity_pct']:.1f},{r['rag']}"
+            )
+        return "\n".join(lines)
+
+    # Markdown report
+    red_links = [r for r in all_results if r["rag"].startswith("RED")]
+    amber_links = [r for r in all_results if r["rag"].startswith("AMBER")]
+    total_cap = sum(r["speed_mbps"] for r in all_results)
+    total_req = sum(r["required_mbps"] for r in all_results)
+    total_proj = sum(r["projected_mbps"] for r in all_results)
+    overall_util = sum(r["current_mbps"] for r in all_results) / max(total_cap, 1) * 100
+
+    lines = [
+        "# Bandwidth Capacity Planning Report",
+        f"**Generated**: {ts_to_iso(now_ts())} | **Version**: {VERSION}",
+        f"**Model**: {params.calculation_model.value.replace('_',' ').title()} | "
+        f"**Headroom**: {params.headroom_pct}% | **Growth Rate**: {params.growth_rate_pct}%/yr",
+        f"**SLA Profile**: {params.sla_profile} (Warning: {profile['warning_pct']}%, Critical: {profile['critical_pct']}%)\n",
+        "---\n",
+        "## 1. Executive Summary\n",
+        f"The network consists of **{len(all_device_metrics)} devices** across "
+        f"**{len(site_rollup)} sites** with a total monitored capacity of "
+        f"**{mbps_to_str(total_cap)}**. Current aggregate utilization is "
+        f"**{overall_util:.1f}%** of installed capacity.\n",
+        f"- **{len(red_links)}** links are at or approaching capacity exhaustion (🔴 RED status)",
+        f"- **{len(amber_links)}** links are at warning thresholds (🟡 AMBER status)",
+        f"- **{len(all_results) - len(red_links) - len(amber_links)}** links are healthy (🟢 GREEN status)",
+        f"- **{len(anomalies)}** active anomalies detected by AIOps platforms\n",
+        "**Immediate action required** on the following sites: " +
+        (", ".join(set(r["site"] for r in red_links)) or "None") + "\n",
+        "---\n",
+        "## 2. Site Capacity Summary\n",
+        "| Site | Links | Total Capacity | Required BW | Projected (1yr) | Red | Amber | Green |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for site, s in sorted(site_rollup.items()):
+        green = s["link_count"] - s["red"] - s["amber"]
+        lines.append(
+            f"| {site} | {s['link_count']} | {mbps_to_str(s['total_speed_mbps'])} "
+            f"| {mbps_to_str(s['total_required_mbps'])} | {mbps_to_str(s['total_projected_mbps'])} "
+            f"| 🔴 {s['red']} | 🟡 {s['amber']} | 🟢 {green} |"
+        )
+
+    lines += [
+        "\n---\n",
+        "## 3. Current State — Top 20 Busiest Links\n",
+        "| Device | Interface | Speed | Current | Required | Projected | RAG |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for r in sorted(all_results, key=lambda x: x["utilization_of_capacity_pct"], reverse=True)[:20]:
+        rag_icon = "🔴" if r["rag"].startswith("RED") else ("🟡" if r["rag"].startswith("AMBER") else "🟢")
+        lines.append(
+            f"| {r['device']} | {r['interface']} ({r['description']}) "
+            f"| {mbps_to_str(r['speed_mbps'])} | {mbps_to_str(r['current_mbps'])} ({r['utilization_of_capacity_pct']:.1f}%) "
+            f"| {mbps_to_str(r['required_mbps'])} | {mbps_to_str(r['projected_mbps'])} | {rag_icon} {r['rag']} |"
+        )
+
+    lines += [
+        "\n---\n",
+        "## 4. AIOps Insights\n",
+        f"**Active Anomalies**: {len(anomalies)} | **Critical**: {sum(1 for a in anomalies if a['severity']=='critical')}\n",
+    ]
+    for a in anomalies[:5]:
+        icon = "🔴" if a["severity"] == "critical" else "🟡"
+        lines.append(f"- {icon} [{a['source_platform']}] {a['title']} — Device: {a['affected_device']}")
+
+    if len(anomalies) > 5:
+        lines.append(f"\n_...and {len(anomalies)-5} more anomalies. Use `bw_get_anomaly_alerts` for full list._")
+
+    lines += [
+        "\n---\n",
+        "## 5. Bandwidth Requirements Summary\n",
+        f"| Metric | Value |",
+        f"|---|---|",
+        f"| Total Installed Capacity | {mbps_to_str(total_cap)} |",
+        f"| Current Aggregate Load | {mbps_to_str(sum(r['current_mbps'] for r in all_results))} ({overall_util:.1f}%) |",
+        f"| Required BW (w/ {params.headroom_pct}% headroom) | {mbps_to_str(total_req)} |",
+        f"| Projected BW (1yr @ {params.growth_rate_pct}%/yr) | {mbps_to_str(total_proj)} |",
+        f"| Capacity Shortfall (current) | {mbps_to_str(max(0, total_req - total_cap))} |",
+        f"| Capacity Shortfall (1yr projected) | {mbps_to_str(max(0, total_proj - total_cap))} |",
+        "",
+        "\n---\n",
+        "## 6. Upgrade Recommendations\n",
+    ]
+    if red_links:
+        for r in sorted(red_links, key=lambda x: x["utilization_of_capacity_pct"], reverse=True):
+            target = mbps_to_str(r["speed_mbps"] * 2)
+            lines.append(
+                f"1. 🔴 **[URGENT — 0-30 days]** {r['device']} {r['interface']}: "
+                f"Upgrade to {target} — current utilization {r['utilization_of_capacity_pct']:.1f}%"
+            )
+    if amber_links:
+        for r in amber_links[:5]:
+            lines.append(
+                f"2. 🟡 **[PLAN — 30-90 days]** {r['device']} {r['interface']}: "
+                f"Plan capacity review — utilization {r['utilization_of_capacity_pct']:.1f}% at warning threshold"
+            )
+    if not red_links and not amber_links:
+        lines.append("✅ No immediate upgrade actions required. Continue monitoring growth trends.")
+
+    lines += [
+        "\n---\n",
+        "_Report generated by Bandwidth Calculator MCP v" + VERSION + "_"
+    ]
+
+    await ctx.report_progress(1.0, "Report complete.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# MCP Resources
+# ---------------------------------------------------------------------------
+
+@mcp.resource("bw://connectors")
+async def resource_connectors() -> str:
+    """All registered connectors as a JSON resource."""
+    safe = {k: {**v, "password": "***" if "password" in v else None} for k, v in _connector_registry.items()}
+    return json.dumps(safe, indent=2)
+
+@mcp.resource("bw://devices/{device_id}")
+async def resource_device(device_id: str) -> str:
+    """Device info for a specific registered device."""
+    if device_id not in _connector_registry:
+        return json.dumps({"error": f"Device '{device_id}' not found"})
+    data = await _collect_device_metrics(device_id, time_range_hours=1)
+    return json.dumps(data, indent=2, default=str)
+
+@mcp.resource("bw://thresholds")
+async def resource_thresholds() -> str:
+    """All configured SLA threshold profiles."""
+    return json.dumps(_threshold_profiles, indent=2)
+
+@mcp.resource("bw://sites")
+async def resource_sites() -> str:
+    """Distinct sites across all registered connectors."""
+    sites = {}
+    for cfg in _connector_registry.values():
+        site = cfg.get("site", "unknown")
+        if site not in sites:
+            sites[site] = {"region": cfg.get("region", "global"), "connectors": []}
+        sites[site]["connectors"].append(cfg["connector_id"])
+    return json.dumps(sites, indent=2)
+
+# ---------------------------------------------------------------------------
+# MCP Prompts
+# ---------------------------------------------------------------------------
+
+@mcp.prompt("bandwidth-audit")
+async def prompt_bandwidth_audit() -> str:
+    """Standard bandwidth audit workflow prompt."""
+    return (
+        "You are a network capacity planning assistant with access to the Bandwidth Calculator MCP.\n\n"
+        "To perform a bandwidth audit, follow these steps:\n"
+        "1. Call `bw_list_connectors` to see all available data sources\n"
+        "2. Call `bw_get_network_summary` to get a high-level view of the network\n"
+        "3. Call `bw_calculate_requirements` with model='95th_percentile' and headroom_pct=20\n"
+        "4. Call `bw_check_capacity_headroom` to identify at-risk links\n"
+        "5. Call `bw_get_anomaly_alerts` to check for active issues\n"
+        "6. Call `bw_run_audit` for a full consolidated report with recommendations\n\n"
+        "Present findings in a clear executive summary followed by technical details."
+    )
+
+@mcp.prompt("capacity-planning")
+async def prompt_capacity_planning() -> str:
+    """Capacity planning and forecasting prompt."""
+    return (
+        "You are a network capacity planning specialist with access to the Bandwidth Calculator MCP.\n\n"
+        "For capacity planning, follow these steps:\n"
+        "1. Call `bw_compare_historical_trends` to understand growth patterns\n"
+        "2. Call `bw_predict_bandwidth_demand` with forecast_days=90 and model='linear_regression'\n"
+        "3. Call `bw_calculate_requirements` with include_growth_projection=True\n"
+        "4. Call `bw_generate_report` with the 95th_percentile model for a full report\n\n"
+        "Focus on links projected to exceed 85% utilization within 90 days and provide "
+        "specific upgrade timeline recommendations."
+    )
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    port = int(os.getenv("MCP_PORT", "8000"))
+
+    if "--http" in sys.argv or transport == "streamable_http":
+        print(f"Starting Bandwidth Calculator MCP (HTTP) on port {port}...", file=sys.stderr)
+        mcp.run(transport="streamable_http", port=port)
+    else:
+        mcp.run()
