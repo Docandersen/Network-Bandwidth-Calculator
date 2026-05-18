@@ -1,0 +1,514 @@
+import { useState, useCallback, useEffect } from "react";
+
+// ─── Helpers ───
+const fmt = (n, d = 2) => (isNaN(n) || !isFinite(n) ? "—" : n.toFixed(d));
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+
+const severity = (v) => {
+  if (v <= 1) return { label: "Low", color: "#22c55e", bg: "rgba(34,197,94,.12)" };
+  if (v <= 2.5) return { label: "Moderate", color: "#eab308", bg: "rgba(234,179,8,.12)" };
+  if (v <= 4) return { label: "Elevated", color: "#f97316", bg: "rgba(249,115,22,.12)" };
+  return { label: "Critical", color: "#ef4444", bg: "rgba(239,68,68,.12)" };
+};
+
+const dcciSeverity = (v) => {
+  if (v <= 1) return { label: "Adequate", color: "#22c55e", bg: "rgba(34,197,94,.12)" };
+  if (v <= 2.5) return { label: "Watch", color: "#eab308", bg: "rgba(234,179,8,.12)" };
+  if (v <= 5) return { label: "Constrained", color: "#f97316", bg: "rgba(249,115,22,.12)" };
+  return { label: "Critical", color: "#ef4444", bg: "rgba(239,68,68,.12)" };
+};
+
+// ─── Shared styles ───
+const VAR = {
+  bg: "#0a0f1a",
+  surface: "#111827",
+  surfaceAlt: "#1a2236",
+  border: "#1e2d45",
+  borderLight: "#263554",
+  text: "#e2e8f0",
+  textDim: "#94a3b8",
+  textMuted: "#64748b",
+  accent: "#2dd4bf",
+  accentDim: "rgba(45,212,191,.15)",
+  navy: "#1e3a5f",
+  teal: "#14b8a6",
+  amber: "#f59e0b",
+  red: "#ef4444",
+  font: "'DM Sans', 'Segoe UI', system-ui, sans-serif",
+  mono: "'JetBrains Mono', 'Fira Code', monospace",
+  radius: "10px",
+};
+
+const inputStyle = {
+  width: "100%",
+  padding: "10px 12px",
+  background: VAR.bg,
+  border: `1px solid ${VAR.border}`,
+  borderRadius: "6px",
+  color: VAR.text,
+  fontFamily: VAR.mono,
+  fontSize: "14px",
+  outline: "none",
+  transition: "border-color .2s",
+  boxSizing: "border-box",
+};
+
+const labelStyle = {
+  display: "block",
+  fontSize: "12px",
+  fontWeight: 600,
+  color: VAR.textDim,
+  marginBottom: "5px",
+  fontFamily: VAR.font,
+  letterSpacing: ".03em",
+  textTransform: "uppercase",
+};
+
+const helpStyle = {
+  fontSize: "11px",
+  color: VAR.textMuted,
+  marginTop: "3px",
+  lineHeight: 1.4,
+};
+
+const cardStyle = {
+  background: VAR.surface,
+  border: `1px solid ${VAR.border}`,
+  borderRadius: VAR.radius,
+  padding: "24px",
+  marginBottom: "16px",
+};
+
+// ─── Input Field ───
+function Field({ label, help, value, onChange, min = 0, max, step = 1, unit }) {
+  return (
+    <div style={{ marginBottom: "14px" }}>
+      <label style={labelStyle}>
+        {label} {unit && <span style={{ color: VAR.textMuted, fontWeight: 400 }}>({unit})</span>}
+      </label>
+      <input
+        type="number"
+        style={inputStyle}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
+        min={min}
+        max={max}
+        step={step}
+        onFocus={(e) => (e.target.style.borderColor = VAR.accent)}
+        onBlur={(e) => (e.target.style.borderColor = VAR.border)}
+      />
+      {help && <div style={helpStyle}>{help}</div>}
+    </div>
+  );
+}
+
+// ─── Gauge ───
+function Gauge({ value, maxVal, sev, size = 160 }) {
+  const pct = clamp(value / maxVal, 0, 1);
+  const angle = pct * 240;
+  const r = size / 2 - 16;
+  const cx = size / 2,
+    cy = size / 2 + 10;
+  const startAngle = -210;
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const arcPoint = (a) => ({
+    x: cx + r * Math.cos(toRad(a)),
+    y: cy + r * Math.sin(toRad(a)),
+  });
+  const start = arcPoint(startAngle);
+  const end = arcPoint(startAngle + angle);
+  const largeArc = angle > 180 ? 1 : 0;
+  const bgEnd = arcPoint(startAngle + 240);
+
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+      <path
+        d={`M ${start.x} ${start.y} A ${r} ${r} 0 1 1 ${bgEnd.x} ${bgEnd.y}`}
+        fill="none"
+        stroke={VAR.border}
+        strokeWidth="10"
+        strokeLinecap="round"
+      />
+      {angle > 0 && (
+        <path
+          d={`M ${start.x} ${start.y} A ${r} ${r} 0 ${largeArc} 1 ${end.x} ${end.y}`}
+          fill="none"
+          stroke={sev.color}
+          strokeWidth="10"
+          strokeLinecap="round"
+        />
+      )}
+      <text
+        x={cx}
+        y={cy - 8}
+        textAnchor="middle"
+        fill={sev.color}
+        fontFamily={VAR.mono}
+        fontSize="28"
+        fontWeight="700"
+      >
+        {fmt(value)}
+      </text>
+      <text
+        x={cx}
+        y={cy + 16}
+        textAnchor="middle"
+        fill={VAR.textDim}
+        fontFamily={VAR.font}
+        fontSize="12"
+        fontWeight="600"
+        letterSpacing=".08em"
+      >
+        {sev.label.toUpperCase()}
+      </text>
+    </svg>
+  );
+}
+
+// ─── Radar Chart for Aggregate ───
+function RadarChart({ data, size = 280 }) {
+  const cx = size / 2, cy = size / 2;
+  const r = size / 2 - 40;
+  const n = data.length;
+  const angleStep = (2 * Math.PI) / n;
+  const levels = [0.25, 0.5, 0.75, 1];
+
+  const point = (i, pct) => ({
+    x: cx + r * pct * Math.sin(i * angleStep),
+    y: cy - r * pct * Math.cos(i * angleStep),
+  });
+
+  const dataPath = data
+    .map((d, i) => {
+      const p = point(i, clamp(d.norm, 0, 1));
+      return `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`;
+    })
+    .join(" ") + " Z";
+
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+      {levels.map((l) => (
+        <polygon
+          key={l}
+          points={data.map((_, i) => { const p = point(i, l); return `${p.x},${p.y}`; }).join(" ")}
+          fill="none"
+          stroke={VAR.border}
+          strokeWidth="1"
+        />
+      ))}
+      {data.map((_, i) => {
+        const p = point(i, 1);
+        return <line key={i} x1={cx} y1={cy} x2={p.x} y2={p.y} stroke={VAR.border} strokeWidth="1" />;
+      })}
+      <polygon points={data.map((d, i) => { const p = point(i, clamp(d.norm, 0, 1)); return `${p.x},${p.y}`; }).join(" ")} fill="rgba(45,212,191,.18)" stroke={VAR.accent} strokeWidth="2" />
+      {data.map((d, i) => {
+        const p = point(i, 1.18);
+        return (
+          <text key={i} x={p.x} y={p.y} textAnchor="middle" dominantBaseline="central" fill={VAR.textDim} fontFamily={VAR.font} fontSize="10" fontWeight="600">
+            {d.label}
+          </text>
+        );
+      })}
+    </svg>
+  );
+}
+
+// ─── Tabs ───
+function Tabs({ tabs, active, onChange }) {
+  return (
+    <div style={{ display: "flex", gap: "4px", background: VAR.bg, borderRadius: "8px", padding: "4px", marginBottom: "20px", overflowX: "auto" }}>
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          onClick={() => onChange(t.id)}
+          style={{
+            flex: "none",
+            padding: "10px 18px",
+            borderRadius: "6px",
+            border: "none",
+            cursor: "pointer",
+            fontFamily: VAR.font,
+            fontSize: "13px",
+            fontWeight: active === t.id ? 700 : 500,
+            color: active === t.id ? VAR.bg : VAR.textDim,
+            background: active === t.id ? VAR.accent : "transparent",
+            transition: "all .2s",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ─── Section Header ───
+function SectionHead({ title, subtitle, formula }) {
+  return (
+    <div style={{ marginBottom: "20px" }}>
+      <h2 style={{ margin: 0, fontSize: "20px", fontWeight: 700, color: VAR.text, fontFamily: VAR.font }}>{title}</h2>
+      {subtitle && <p style={{ margin: "4px 0 0", fontSize: "13px", color: VAR.textDim, lineHeight: 1.5 }}>{subtitle}</p>}
+      {formula && (
+        <div style={{ marginTop: "12px", padding: "12px 16px", background: VAR.bg, borderRadius: "8px", border: `1px solid ${VAR.border}`, fontFamily: VAR.mono, fontSize: "14px", color: VAR.accent, letterSpacing: ".02em" }}>
+          {formula}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Result Badge ───
+function ResultBadge({ label, value, sev }) {
+  return (
+    <div style={{ display: "inline-flex", alignItems: "center", gap: "8px", padding: "6px 14px", borderRadius: "20px", background: sev.bg, border: `1px solid ${sev.color}33` }}>
+      <span style={{ width: 8, height: 8, borderRadius: "50%", background: sev.color }} />
+      <span style={{ fontFamily: VAR.font, fontSize: "13px", fontWeight: 600, color: sev.color }}>{label}: {value}</span>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════
+//  FORMULA 1: AI Network Impact Score
+// ═══════════════════════════════════
+function ImpactScoreCalc({ onResult }) {
+  const [vals, setVals] = useState({ U: 500, AIW: 15, CS: 1.3, LL: 1.5, B: 10000, A: 0.7 });
+  const set = (k) => (v) => setVals((p) => ({ ...p, [k]: v }));
+
+  const IS = (vals.U * vals.AIW * vals.CS * vals.LL) / (vals.B * vals.A);
+  const sev = severity(IS);
+
+  useEffect(() => { onResult({ IS, sev }); }, [IS]);
+
+  return (
+    <div>
+      <SectionHead
+        title="AI Network Impact Score"
+        subtitle="Estimates organizational AI pressure on network infrastructure by site, segment, or traffic class."
+        formula="IS = (U × AIW × CS × LL) / (B × A)"
+      />
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 20px" }}>
+        <Field label="Simultaneous AI Users" help="Users or systems generating AI traffic concurrently" value={vals.U} onChange={set("U")} unit="U" />
+        <Field label="Avg AI Workload per User" help="Mbps consumed per user session (inference, RAG, multimodal)" value={vals.AIW} onChange={set("AIW")} step={0.5} unit="AIW — Mbps" />
+        <Field label="Cybersecurity Risk Factor" help="Overhead multiplier for security inspection (1.0 = none, 1.5 = heavy)" value={vals.CS} onChange={set("CS")} step={0.1} min={1} max={3} unit="CS" />
+        <Field label="Latency Sensitivity Factor" help="Multiplier for latency-critical workloads (1.0 = tolerant, 2.0 = real-time)" value={vals.LL} onChange={set("LL")} step={0.1} min={1} max={3} unit="LL" />
+        <Field label="Provisioned AI Bandwidth" help="Total bandwidth available to AI traffic at this site/segment" value={vals.B} onChange={set("B")} step={100} unit="B — Mbps" />
+        <Field label="Adjustment Factor" help="Background load, oversubscription, reliability (0.5 = heavy contention, 1.0 = dedicated)" value={vals.A} onChange={set("A")} step={0.05} min={0.1} max={1} unit="A" />
+      </div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: "12px", flexWrap: "wrap", gap: "16px" }}>
+        <Gauge value={IS} maxVal={8} sev={sev} />
+        <div style={{ flex: 1, minWidth: 200 }}>
+          <ResultBadge label="Impact Score" value={fmt(IS)} sev={sev} />
+          <div style={{ marginTop: "12px", fontSize: "13px", color: VAR.textDim, lineHeight: 1.6 }}>
+            {IS <= 1 && "Network capacity is comfortably ahead of AI demand at current utilization. Headroom exists for adoption growth."}
+            {IS > 1 && IS <= 2.5 && "AI workloads are generating measurable pressure. Monitor peak windows and plan capacity for the next adoption phase."}
+            {IS > 2.5 && IS <= 4 && "AI traffic is approaching or exceeding comfortable thresholds. Prioritize QoS policies, path steering, and capacity upgrades."}
+            {IS > 4 && "AI demand significantly exceeds provisioned capacity. Immediate action required: segment traffic, add bandwidth, or throttle adoption."}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════
+//  FORMULA 2: DCCI
+// ═══════════════════════════════════
+function DCCICalc({ onResult }) {
+  const [vals, setVals] = useState({
+    T: 2000, I: 5000, D: 3000, O: 500,
+    SF: 1.2, RF: 1.3, GF: 1.1,
+    BDC: 100000, A: 0.8, FE: 0.85,
+  });
+  const set = (k) => (v) => setVals((p) => ({ ...p, [k]: v }));
+
+  const num = (vals.T + vals.I + vals.D + vals.O) * vals.SF * vals.RF * vals.GF;
+  const den = vals.BDC * vals.A * vals.FE;
+  const DCCI = den > 0 ? num / den : 0;
+  const sev = dcciSeverity(DCCI);
+
+  useEffect(() => { onResult({ DCCI, sev, T: vals.T, I: vals.I, D: vals.D, O: vals.O }); }, [DCCI, vals.T, vals.I, vals.D, vals.O]);
+
+  return (
+    <div>
+      <SectionHead
+        title="Data Center Communication Index"
+        subtitle="Models AI demand across training, inference, data movement, and observability within and between data centers."
+        formula="DCCI = ((T + I + D + O) × SF × RF × GF) / (B_DC × A × FE)"
+      />
+      <h3 style={{ fontSize: "13px", fontWeight: 700, color: VAR.accent, textTransform: "uppercase", letterSpacing: ".06em", margin: "0 0 12px" }}>Demand Components</h3>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 20px" }}>
+        <Field label="Training Communication" help="Gradient sync, checkpoint writes, dataset reads, accelerator coordination" value={vals.T} onChange={set("T")} step={100} unit="T — Mbps" />
+        <Field label="Inference & User Comm" help="Model serving, user sessions, streaming responses, RAG retrieval" value={vals.I} onChange={set("I")} step={100} unit="I — Mbps" />
+        <Field label="Data Movement" help="ETL, replication, vector store sync, model artifact distribution" value={vals.D} onChange={set("D")} step={100} unit="D — Mbps" />
+        <Field label="Observability & Control" help="Logs, traces, metrics, policy events, audit streams, telemetry" value={vals.O} onChange={set("O")} step={50} unit="O — Mbps" />
+      </div>
+      <h3 style={{ fontSize: "13px", fontWeight: 700, color: VAR.accent, textTransform: "uppercase", letterSpacing: ".06em", margin: "16px 0 12px" }}>Multipliers</h3>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "0 20px" }}>
+        <Field label="Security Factor" help="Encryption, inspection, DLP overhead" value={vals.SF} onChange={set("SF")} step={0.1} min={1} max={3} unit="SF" />
+        <Field label="Resilience Factor" help="Replication, failover, redundancy overhead" value={vals.RF} onChange={set("RF")} step={0.1} min={1} max={3} unit="RF" />
+        <Field label="Geography Factor" help="Multi-region, latency penalties, cross-DC overhead" value={vals.GF} onChange={set("GF")} step={0.1} min={1} max={3} unit="GF" />
+      </div>
+      <h3 style={{ fontSize: "13px", fontWeight: 700, color: VAR.accent, textTransform: "uppercase", letterSpacing: ".06em", margin: "16px 0 12px" }}>Capacity</h3>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "0 20px" }}>
+        <Field label="DC Bandwidth" help="Total available data center communication bandwidth" value={vals.BDC} onChange={set("BDC")} step={1000} unit="B_DC — Mbps" />
+        <Field label="Adjustment Factor" help="Background load and contention (0.5–1.0)" value={vals.A} onChange={set("A")} step={0.05} min={0.1} max={1} unit="A" />
+        <Field label="Fabric Efficiency" help="Usable vs. theoretical throughput (0.5–1.0)" value={vals.FE} onChange={set("FE")} step={0.05} min={0.3} max={1} unit="FE" />
+      </div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: "12px", flexWrap: "wrap", gap: "16px" }}>
+        <Gauge value={DCCI} maxVal={10} sev={sev} />
+        <div style={{ flex: 1, minWidth: 200 }}>
+          <ResultBadge label="DCCI" value={fmt(DCCI)} sev={sev} />
+          <div style={{ marginTop: "12px", fontSize: "13px", color: VAR.textDim, lineHeight: 1.6 }}>
+            {DCCI <= 1 && "Data center fabric has sufficient capacity for current AI workloads. Plan ahead for training or inference scale-up."}
+            {DCCI > 1 && DCCI <= 2.5 && "DC communication is under moderate pressure. Review east-west bottlenecks, storage-to-GPU paths, and fabric telemetry."}
+            {DCCI > 2.5 && DCCI <= 5 && "Fabric capacity is constrained. Prioritize DCI upgrades, fabric efficiency improvements, and workload scheduling."}
+            {DCCI > 5 && "Data center fabric is critically overloaded. Immediate intervention needed: add fabric capacity, distribute workloads, or defer training jobs."}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════
+//  AGGREGATE VIEW
+// ═══════════════════════════════════
+function AggregateView({ isResult, dcciResult }) {
+  const { IS = 0, sev: isSev = severity(0) } = isResult || {};
+  const { DCCI = 0, sev: dcciSev = dcciSeverity(0), T = 0, I: Inf = 0, D = 0, O = 0 } = dcciResult || {};
+
+  const combined = (IS + DCCI) / 2;
+  const combSev = severity(combined);
+
+  const totalDemand = T + Inf + D + O;
+  const radarData = [
+    { label: "Training", norm: totalDemand > 0 ? T / totalDemand : 0 },
+    { label: "Inference", norm: totalDemand > 0 ? Inf / totalDemand : 0 },
+    { label: "Data Mvmt", norm: totalDemand > 0 ? D / totalDemand : 0 },
+    { label: "Observability", norm: totalDemand > 0 ? O / totalDemand : 0 },
+    { label: "Net Impact", norm: clamp(IS / 6, 0, 1) },
+  ];
+
+  const barData = [
+    { label: "AI Net Impact", value: IS, max: 8, color: isSev.color },
+    { label: "DC Comm Index", value: DCCI, max: 10, color: dcciSev.color },
+    { label: "Combined", value: combined, max: 8, color: combSev.color },
+  ];
+
+  const getBand = (v) => {
+    if (v <= 1) return { name: "Green", desc: "AI workloads are within network and DC capacity. Continue monitoring adoption growth." };
+    if (v <= 2.5) return { name: "Yellow", desc: "Moderate pressure across WAN and DC. Initiate capacity planning and traffic classification." };
+    if (v <= 4) return { name: "Orange", desc: "Elevated risk. Prioritize QoS, fabric upgrades, path steering, and workload segmentation." };
+    return { name: "Red", desc: "Critical overload. Immediate action required across both network and data center infrastructure." };
+  };
+  const band = getBand(combined);
+
+  return (
+    <div>
+      <SectionHead
+        title="Aggregate Assessment"
+        subtitle="Combined view of AI Network Impact Score and Data Center Communication Index with overall readiness posture."
+      />
+
+      {/* Score cards */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px", marginBottom: "24px" }}>
+        {barData.map((b) => (
+          <div key={b.label} style={{ background: VAR.surfaceAlt, borderRadius: "8px", padding: "16px", border: `1px solid ${VAR.border}`, textAlign: "center" }}>
+            <div style={{ fontSize: "11px", fontWeight: 700, color: VAR.textMuted, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: "8px" }}>{b.label}</div>
+            <div style={{ fontFamily: VAR.mono, fontSize: "32px", fontWeight: 700, color: b.color }}>{fmt(b.value)}</div>
+            <div style={{ marginTop: "8px", height: "6px", background: VAR.bg, borderRadius: "3px", overflow: "hidden" }}>
+              <div style={{ height: "100%", width: `${clamp(b.value / b.max, 0, 1) * 100}%`, background: b.color, borderRadius: "3px", transition: "width .4s" }} />
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Radar + Summary */}
+      <div style={{ display: "flex", gap: "24px", flexWrap: "wrap", alignItems: "flex-start" }}>
+        <div style={{ background: VAR.surfaceAlt, borderRadius: "8px", padding: "16px", border: `1px solid ${VAR.border}`, textAlign: "center" }}>
+          <div style={{ fontSize: "11px", fontWeight: 700, color: VAR.textMuted, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: "4px" }}>Demand Distribution</div>
+          <RadarChart data={radarData} />
+        </div>
+        <div style={{ flex: 1, minWidth: 240 }}>
+          <div style={{ padding: "20px", borderRadius: "8px", background: combSev.bg, border: `1px solid ${combSev.color}33`, marginBottom: "16px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "8px" }}>
+              <span style={{ width: 12, height: 12, borderRadius: "50%", background: combSev.color }} />
+              <span style={{ fontFamily: VAR.font, fontSize: "16px", fontWeight: 700, color: combSev.color }}>Overall Band: {band.name}</span>
+            </div>
+            <p style={{ margin: 0, fontSize: "13px", color: VAR.text, lineHeight: 1.6 }}>{band.desc}</p>
+          </div>
+
+          <div style={{ fontSize: "13px", color: VAR.textDim, lineHeight: 1.7 }}>
+            <p style={{ margin: "0 0 10px" }}><strong style={{ color: VAR.text }}>What this means:</strong> The combined score averages WAN-level AI pressure (IS) with data center fabric pressure (DCCI) to give a single organizational readiness indicator.</p>
+            <p style={{ margin: "0 0 10px" }}><strong style={{ color: VAR.text }}>Next steps:</strong> Use the individual calculators to model specific sites, segments, and data center environments. Apply scores by traffic class, user group, and workflow path rather than relying on a single enterprise average.</p>
+            <p style={{ margin: 0 }}><strong style={{ color: VAR.text }}>Source:</strong> <em>Data on the Move: Understanding how data will move across future networks in the age of AI</em> — S. Andersen, CTI</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════
+//  MAIN APP
+// ═══════════════════════════════════
+export default function App() {
+  const [tab, setTab] = useState("is");
+  const [isResult, setIsResult] = useState(null);
+  const [dcciResult, setDcciResult] = useState(null);
+
+  const tabs = [
+    { id: "is", label: "AI Network Impact Score" },
+    { id: "dcci", label: "DC Communication Index" },
+    { id: "agg", label: "Aggregate Assessment" },
+  ];
+
+  return (
+    <div style={{ minHeight: "100vh", background: VAR.bg, color: VAR.text, fontFamily: VAR.font }}>
+      {/* Header */}
+      <div style={{ padding: "28px 32px 0", maxWidth: 960, margin: "0 auto" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "14px", marginBottom: "4px" }}>
+          <div style={{ width: 40, height: 40, borderRadius: "8px", background: `linear-gradient(135deg, ${VAR.accent}, ${VAR.navy})`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round"><path d="M2 20h20M5 20V10M9 20V4M13 20v-8M17 20V6M21 20v-4" /></svg>
+          </div>
+          <div>
+            <h1 style={{ margin: 0, fontSize: "22px", fontWeight: 800, letterSpacing: "-.02em" }}>
+              AI Bandwidth Impact Calculator
+            </h1>
+            <p style={{ margin: 0, fontSize: "12px", color: VAR.textMuted, letterSpacing: ".04em" }}>
+              BASED ON <em>DATA ON THE MOVE</em> — CTI / S. ANDERSEN
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Body */}
+      <div style={{ maxWidth: 960, margin: "0 auto", padding: "20px 32px 40px" }}>
+        <Tabs tabs={tabs} active={tab} onChange={setTab} />
+
+        <div style={cardStyle}>
+          {tab === "is" && <ImpactScoreCalc onResult={setIsResult} />}
+          {tab === "dcci" && <DCCICalc onResult={setDcciResult} />}
+          {tab === "agg" && <AggregateView isResult={isResult} dcciResult={dcciResult} />}
+        </div>
+
+        {/* Legend */}
+        <div style={{ display: "flex", gap: "16px", flexWrap: "wrap", justifyContent: "center", padding: "12px 0" }}>
+          {[
+            { c: "#22c55e", l: "Low / Adequate (≤1.0)" },
+            { c: "#eab308", l: "Moderate / Watch (1.0–2.5)" },
+            { c: "#f97316", l: "Elevated / Constrained (2.5–4.0)" },
+            { c: "#ef4444", l: "Critical (>4.0)" },
+          ].map((i) => (
+            <div key={i.l} style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "11px", color: VAR.textMuted }}>
+              <span style={{ width: 10, height: 10, borderRadius: "3px", background: i.c }} />
+              {i.l}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
