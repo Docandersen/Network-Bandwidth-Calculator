@@ -1,0 +1,1200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Network Bandwidth Planner</title>
+<meta name="description" content="Model human, AI and agentic demand using Scott Andersen's IS v2 model and export a bandwidth assessment PDF.">
+<style>
+:root{font-family:Inter,Arial,sans-serif;color:#1c3241;background:#f3f5f6;font-synthesis:none}
+*{box-sizing:border-box}
+body{margin:0}
+header{height:78px;background:#fff;border-bottom:1px solid #dce4e7;display:flex;align-items:center;justify-content:space-between;padding:0 5%}
+.brand{text-decoration:none;font-size:25px;font-weight:800;color:#1a514f;letter-spacing:-1px}
+.brand span{font-size:11px;letter-spacing:1.5px;margin-left:14px;color:#526974}
+.pill,.eyebrow{font-size:11px;font-weight:700;letter-spacing:1.6px}
+.pill{border:1px solid #dae3e6;border-radius:30px;padding:9px 14px;color:#52706c}
+main{max-width:1480px;margin:auto;padding:45px 5% 15px}
+.hero{padding:0 0 30px}
+.eyebrow{color:#27756f}
+h1{font-size:clamp(30px,4vw,49px);letter-spacing:-1.8px;margin:14px 0;color:#18323f}
+p{line-height:1.65;color:#61717a}
+.hero p{font-size:16px;margin-bottom:0}
+.toolbar{display:flex;justify-content:space-between;align-items:center;gap:15px;padding:20px 0;border-top:1px solid #dae1e5}
+.toolbar strong{display:block;font-size:15px}
+.toolbar span{font-size:11px;color:#697d82;display:block;margin-top:6px}
+.actions{display:flex;gap:7px;flex-wrap:wrap}
+button{background:white;border:1px solid #cdd9df;padding:10px 13px;color:#314c59;border-radius:7px;cursor:pointer;font-weight:600;font-size:12px}
+button:hover{background:#e9f2f1;border-color:#73a39c}
+button.primary{background:#1c6e64;color:white;border-color:#1c6e64}
+button:disabled{opacity:.45;cursor:not-allowed}
+.layout{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:25px;align-items:start}
+nav{display:flex;gap:5px;flex-wrap:wrap;padding:5px 0 15px}
+nav button{background:transparent;border-color:transparent}
+nav button.selected{background:#dfeeea;color:#185d55;border-color:#b9d9d1}
+.panel,.result-card{background:#fff;border:1px solid #dde5e8;border-radius:12px;padding:25px}
+.section-head{display:flex;justify-content:space-between;align-items:start;gap:10px}
+h2{font-size:22px;letter-spacing:-.6px;margin:0 0 9px}
+h3{font-size:16px;margin:0 0 10px}
+.intro{font-size:13px;margin:0 0 24px}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+label{display:block;font-size:12px;font-weight:600;color:#49606c}
+input,select,textarea{width:100%;margin-top:7px;background:#fafcfc;border:1px solid #cedade;border-radius:6px;padding:11px;font:14px Arial;color:#203d4b;min-width:0}
+input:focus,select:focus,textarea:focus{outline:2px solid #58a99b;outline-offset:1px}
+textarea{min-height:95px}
+label.full{grid-column:1/-1}
+.hint{display:block;font-weight:400;color:#71838b;font-size:11px;margin-top:5px;line-height:1.5}
+.row-card{border:1px solid #dce5e8;padding:16px;border-radius:9px;margin:15px 0;background:#fff}
+.row-title{display:flex;gap:10px;align-items:center;margin-bottom:15px}
+.row-title input{margin:0;font-weight:600;background:#f2f7f6}
+.remove{padding:8px;color:#9b4a43;font-weight:400}
+.smallgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.calls{margin-top:18px;padding:14px;background:#f3f7f7;border-radius:8px}
+.call{display:grid;grid-template-columns:2fr 1fr 1fr 1fr auto;gap:8px;align-items:end;border-bottom:1px solid #dce5e8;padding:12px 0}
+.call label{font-size:10px}
+.call input{padding:9px}
+.check{display:flex;gap:8px;align-items:center;margin:16px 0}
+.check input{width:auto;margin:0}
+aside{padding-top:5px;position:sticky;top:20px}
+.result-card{margin-bottom:13px}
+.result-card h3{font-size:11px;text-transform:uppercase;letter-spacing:1.3px;color:#60807e}
+.score{font-size:57px;letter-spacing:-3px;font-weight:700;color:#1b6e63;margin:4px 0}
+.status{display:inline-block;border-radius:20px;background:#edf1de;padding:6px 12px;font-size:12px;font-weight:700;color:#72622d}
+.bad .score{color:#b14439}
+.gauge{height:7px;background:linear-gradient(to right,#5ea18c 0 60%,#c6ad61 60% 85%,#d98d51 85% 100%);border-radius:5px;margin:18px 0;position:relative}
+.gauge i{position:absolute;top:-4px;height:15px;width:3px;background:#203c45}
+.metric{display:flex;justify-content:space-between;gap:12px;font-size:12px;margin:15px 0;color:#677c85}
+.metric b{color:#253f4c;text-align:right}
+.bar{height:9px;display:flex;overflow:hidden;border-radius:5px;background:#eef2f3;margin:16px 0}
+.bar span{height:100%}
+.advice{font-size:12px;line-height:1.6;margin-bottom:0}
+.method{margin:27px 0;padding:0 4px}
+.method h3{font-size:13px}
+.method code{display:block;font-size:12px;line-height:1.8;color:#346762;white-space:normal}
+.method p,details{font-size:12px}
+summary{cursor:pointer;color:#416269}
+footer{padding:25px 0;border-top:1px solid #dce4e7;font-size:11px;color:#6c8088;line-height:1.8}
+footer span{display:block}
+#errors:not(:empty){padding:14px;background:#fff0eb;border:1px solid #e3b5aa;color:#983e34;border-radius:8px;margin:10px 0;font-size:13px}
+.muted{color:#71858d;font-size:12px}
+.divider{border:0;border-top:1px solid #e1e7e9;margin:24px 0}
+@media(max-width:1050px){
+  .layout{grid-template-columns:minmax(0,1fr) 290px}
+  .toolbar{align-items:start;flex-direction:column}
+  .call{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:760px){
+  main{padding:28px 5%}
+  .layout{grid-template-columns:1fr}
+  aside{position:static;grid-row:1}
+  .result-card{padding:20px}
+  .grid,.smallgrid{grid-template-columns:1fr 1fr}
+  header .pill{display:none}
+  .panel{padding:20px}
+  .brand span{font-size:9px}
+  .score{font-size:45px}
+  nav{gap:1px}
+  nav button{padding:9px}
+  .call{grid-template-columns:1fr 1fr}
+}
+@media print{
+  header,nav,.toolbar,#form{display:none}
+  .layout{display:block}
+  aside{position:static}
+  .result-card{break-inside:avoid}
+}
+</style>
+</head>
+<body>
+<header>
+  <a class="brand" href="#">CTI <span>NETWORK INTELLIGENCE</span></a>
+  <span class="pill">IS v2 · CAPACITY PLANNING</span>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="eyebrow">CREATIVE TECHNOLOGY & INNOVATION</div>
+    <h1>Plan for the whole load.</h1>
+    <p>Human activity, AI workloads and autonomous agents.<br>
+    One transparent model for your next bandwidth decision.</p>
+  </section>
+
+  <div class="toolbar">
+    <div>
+      <strong id="scenarioName"></strong>
+      <span id="saved" role="status">Saved in this browser</span>
+    </div>
+    <div class="actions">
+      <button id="blank">New assessment</button>
+      <button id="demo">Load example</button>
+      <button id="import">Import JSON</button>
+      <input type="file" id="file" accept=".json,application/json" hidden>
+      <button id="export">Export inputs</button>
+      <button id="pdf" class="primary">↓ Download PDF report</button>
+    </div>
+  </div>
+
+  <div id="errors" role="alert"></div>
+
+  <div class="layout">
+    <div>
+      <nav aria-label="Input categories" id="tabs"></nav>
+      <section id="form" class="panel"></section>
+
+      <section class="method">
+        <h3>The model behind the decision</h3>
+        <code>IS = (Human + AI + Agents + Other − Overlap) / (Bandwidth × A × ρ)</code>
+        <p>Modeling Network Load in the AI Era v2 · Scott O Andersen · October 13, 2026.
+        Defaults are illustrative. Use measured inputs for your link and observation window.</p>
+        <details>
+          <summary>Measurement rules and status bands</summary>
+          <p>Score one link, one direction and one interval. All rates and payloads must
+          cross that observation point in the selected direction. Agent payloads use
+          decimal MB; enter only the bytes in that direction, rather than combined
+          requests and responses. Measured aggregate values already include inspection
+          and replace estimates.</p>
+          <p>Human activity shares may sum above 100% because activities can coexist.
+          AI profiles must represent distinct traffic or populations. Remove known
+          duplicate traffic using overlap. The utilization ceiling already reserves
+          latency headroom. The 0.85 score target provides a separate growth buffer.</p>
+          <p>Headroom: IS below 0.60. Watch: 0.60 to below 0.85. Plan: 0.85 through 1.00.
+          Overloaded: above 1.00. Validate actual RTT, jitter, loss, queueing and inspection
+          session capacity separately.</p>
+          <p>Security defaults by class 1–5: 2%, 5%, 10%, 15%, 25%.
+          Latency ceilings by class 1–5: 85%, 75%, 65%, 55%, 45%.
+          Every overhead and the selected ceiling can be edited.</p>
+        </details>
+      </section>
+    </div>
+
+    <aside id="results" aria-live="polite"></aside>
+  </div>
+
+  <footer>
+    Built from the IS v2 model by Scott O Andersen.
+    <span>Inputs stay in this browser. Export JSON to move or back up an assessment.</span>
+  </footer>
+</main>
+
+<script>
+(() => {
+  const security = [2, 5, 10, 15, 25];
+  const ceilings = [85, 75, 65, 55, 45];
+
+  function defaults() {
+    return {
+      version: 1,
+      title: "2,000 user office",
+      link: "Internet edge",
+      direction: "Egress",
+      interval: "Busy hour",
+      date: new Date().toISOString().slice(0, 10),
+      notes: "Illustrative planning inputs from Modeling Network Load in the AI Era v2. Replace with measured data.",
+      users: 2000,
+      bandwidth: 10000,
+      availability: 100,
+      ceiling: 65,
+      latency: 3,
+      background: 15,
+      humanSecurity: 5,
+      overlap: 0,
+      burst: 2,
+      humanMeasured: false,
+      humanMbps: 0,
+
+      human: [
+        ["Video meetings", 25, 3],
+        ["Voice and UC", 10, 0.1],
+        ["File sync and sharing", 100, 0.2],
+        ["Messaging and email", 100, 0.05],
+        ["Web SaaS and business apps", 100, 0.4],
+        ["Streaming and other activity", 100, 0.2]
+      ].map(([name, share, rate]) => ({ name, share, rate })),
+
+      ai: [{
+        name: "Human driven AI",
+        users: 2000,
+        adoption: 40,
+        concurrency: 50,
+        rate: 2,
+        security: 10,
+        measured: false,
+        mbps: 0
+      }],
+
+      services: [],
+
+      agents: [{
+        name: "Enterprise agent",
+        count: 3000,
+        runs: 6,
+        security: 15,
+        measured: false,
+        mbps: 0,
+        calls: [
+          ["Model inference", 12, 1, 1.1],
+          ["Retrieval", 4, 3, 1.05],
+          ["Tools and APIs", 10, 0.15, 1.25],
+          ["Evidence and audit", 2, 0.15, 1]
+        ].map(([name, count, mb, retry]) => ({ name, count, mb, retry }))
+      }],
+
+      other: []
+    };
+  }
+
+  function validate(s) {
+    const errors = [];
+
+    const check = (value, min, max, label) => {
+      if (
+        typeof value !== "number" ||
+        !Number.isFinite(value) ||
+        value < min ||
+        value > max
+      ) {
+        errors.push(label + " must be between " + min + " and " + max);
+      }
+    };
+
+    check(s.users, 0, 1e12, "Users");
+    check(s.bandwidth, 0.001, 1e12, "Link capacity");
+    check(s.availability, 0.001, 100, "Reliable capacity");
+    check(s.ceiling, 0.001, 100, "Utilization ceiling");
+    check(s.background, 0, 10000, "Background");
+    check(s.humanSecurity, 0, 10000, "Human security");
+    check(s.overlap, 0, 1e12, "Overlap");
+    check(s.burst, 1, 10000, "Agent burst factor");
+    check(s.humanMbps, 0, 1e12, "Measured human traffic");
+
+    for (const r of s.human) {
+      check(r.share, 0, 100, r.name + " share");
+      check(r.rate, 0, 1e12, r.name + " rate");
+    }
+
+    for (const r of s.ai) {
+      for (const k of ["users", "rate", "mbps", "security"]) {
+        check(r[k], 0, 1e12, r.name + " " + k);
+      }
+      for (const k of ["adoption", "concurrency"]) {
+        check(r[k], 0, 100, r.name + " " + k);
+      }
+    }
+
+    for (const r of s.services) {
+      check(r.mbps, 0, 1e12, r.name + " Mbps");
+    }
+
+    for (const r of s.agents) {
+      for (const k of ["count", "runs", "security", "mbps"]) {
+        check(r[k], 0, 1e12, r.name + " " + k);
+      }
+
+      for (const c of r.calls) {
+        for (const k of ["count", "mb"]) {
+          check(c[k], 0, 1e12, c.name + " " + k);
+        }
+        check(c.retry, 1, 10000, c.name + " retry");
+      }
+    }
+
+    for (const r of s.other) {
+      for (const k of ["population", "rate", "security"]) {
+        check(r[k], 0, 1e12, r.name + " " + k);
+      }
+      for (const k of ["share", "active"]) {
+        check(r[k], 0, 100, r.name + " " + k);
+      }
+    }
+
+    return errors;
+  }
+
+  function calculate(s) {
+    const human = s.humanMeasured
+      ? s.humanMbps
+      : s.users *
+        s.human.reduce((sum, r) => sum + r.share / 100 * r.rate, 0) *
+        (1 + s.background / 100) *
+        (1 + s.humanSecurity / 100);
+
+    const aiRows = s.ai.map(r =>
+      r.measured
+        ? r.mbps
+        : r.users *
+          r.adoption / 100 *
+          r.concurrency / 100 *
+          r.rate *
+          (1 + r.security / 100)
+    );
+
+    const services = s.services.reduce((sum, r) => sum + r.mbps, 0);
+    const ai = aiRows.reduce((sum, value) => sum + value, 0) + services;
+
+    const volumes = s.agents.map(r =>
+      r.calls.reduce((sum, c) => sum + c.count * c.mb * c.retry, 0)
+    );
+
+    const agentRows = s.agents.map((r, i) =>
+      r.measured
+        ? r.mbps
+        : r.count *
+          r.runs *
+          volumes[i] *
+          8 / 3600 *
+          (1 + r.security / 100)
+    );
+
+    const agents = agentRows.reduce((sum, value) => sum + value, 0);
+
+    const others = s.other.map(r =>
+      r.population *
+      r.share / 100 *
+      r.active / 100 *
+      r.rate *
+      (1 + r.security / 100)
+    );
+
+    const other = others.reduce((sum, value) => sum + value, 0);
+    const gross = human + ai + agents + other;
+    const total = gross - s.overlap;
+    const capacity = s.bandwidth * s.availability / 100 * s.ceiling / 100;
+    const is = total / capacity;
+
+    return {
+      human,
+      ai,
+      agents,
+      other,
+      services,
+      aiRows,
+      agentRows,
+      volumes,
+      others,
+      gross,
+      total,
+      capacity,
+      is,
+      status: is < 0.6
+        ? "Headroom"
+        : is < 0.85
+          ? "Watch"
+          : is <= 1
+            ? "Plan"
+            : "Overloaded",
+      raw: total / s.bandwidth,
+      remaining: capacity - total,
+      required: total / (s.availability / 100 * s.ceiling / 100),
+      growth: total / (s.availability / 100 * s.ceiling / 100 * 0.85),
+      burst: (total + agents * (s.burst - 1)) / capacity,
+      aiUplift: human ? ai / human : null,
+      agentUplift: human ? agents / human : null,
+      perUser: s.users ? total / s.users : null
+    };
+  }
+
+  // Dependency-free PDF writer using standard PDF fonts.
+  function pdfBlob(lines) {
+    const clean = text =>
+      String(text).normalize("NFKD").replace(/[^\x20-\x7E]/g, " ");
+
+    const wrapped = [];
+
+    for (const text of lines) {
+      let line = clean(text);
+
+      while (line.length > 94) {
+        let cut = line.lastIndexOf(" ", 94);
+        if (cut < 20) cut = 94;
+        wrapped.push(line.slice(0, cut));
+        line = line.slice(cut).trimStart();
+      }
+
+      wrapped.push(line);
+    }
+
+    const pages = [];
+
+    for (let i = 0; i < wrapped.length; i += 47) {
+      pages.push(wrapped.slice(i, i + 47));
+    }
+
+    const objects = [
+      "",
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "",
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+    ];
+
+    const pageIds = [];
+
+    pages.forEach((rows, i) => {
+      const id = objects.length;
+      pageIds.push(id);
+
+      objects.push(
+        `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ` +
+        `/Resources << /Font << /F1 3 0 R >> >> /Contents ${id + 1} 0 R >>`
+      );
+
+      const escapePdf = text => text.replace(/([\\()])/g, "\\$1");
+
+      const stream =
+        "BT /F1 10 Tf 48 748 Td 14 TL\n" +
+        rows.map((line, j) =>
+          (j ? "T* " : "") + "(" + escapePdf(line) + ") Tj"
+        ).join("\n") +
+        `\nET\nBT /F1 9 Tf 48 30 Td ` +
+        `(AI Network Bandwidth Planner | Page ${i + 1} of ${pages.length}) Tj ET`;
+
+      objects.push(
+        `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`
+      );
+    });
+
+    objects[2] =
+      `<< /Type /Pages /Kids [` +
+      pageIds.map(i => i + " 0 R").join(" ") +
+      `] /Count ${pages.length} >>`;
+
+    let output = "%PDF-1.4\n";
+    const offsets = [0];
+
+    for (let i = 1; i < objects.length; i++) {
+      offsets[i] = output.length;
+      output += `${i} 0 obj\n${objects[i]}\nendobj\n`;
+    }
+
+    const xref = output.length;
+    output += `xref\n0 ${objects.length}\n0000000000 65535 f \n`;
+
+    for (let i = 1; i < objects.length; i++) {
+      output += String(offsets[i]).padStart(10, "0") + " 00000 n \n";
+    }
+
+    output +=
+      `trailer\n<< /Size ${objects.length} /Root 1 0 R >>\n` +
+      `startxref\n${xref}\n%%EOF`;
+
+    return new Blob([output], { type: "application/pdf" });
+  }
+
+  function reportLines(s, r) {
+    const n = value => value === null
+      ? "N/A"
+      : Number(value).toLocaleString("en-US", { maximumFractionDigits: 3 });
+
+    const lines = [
+      "BANDWIDTH ASSESSMENT REPORT",
+      s.title,
+      `Date: ${s.date} | Link: ${s.link}`,
+      `Direction: ${s.direction} | Observation interval: ${s.interval}`,
+      "",
+      "RESULTS",
+      `Impact Score: ${n(r.is)} | Status: ${r.status}`,
+      `Total demand: ${n(r.total)} Mbps | Usable capacity: ${n(r.capacity)} Mbps`,
+      `Nominal utilization: ${n(r.raw * 100)}% | Remaining usable capacity: ${n(r.remaining)} Mbps`,
+      `Human: ${n(r.human)} Mbps | AI including services: ${n(r.ai)} Mbps`,
+      `Agents: ${n(r.agents)} Mbps | Additional classes: ${n(r.other)} Mbps`,
+      `Overlap removed: ${n(s.overlap)} Mbps`,
+      `AI uplift over human baseline: ${r.aiUplift === null ? "N/A" : n(r.aiUplift * 100) + "%"}`,
+      `Agent uplift over human baseline: ${r.agentUplift === null ? "N/A" : n(r.agentUplift * 100) + "%"}`,
+      `Demand per user: ${n(r.perUser)} Mbps (reporting only)`,
+      `Required nominal capacity at IS 1: ${n(r.required)} Mbps`,
+      `Nominal capacity at IS 0.85: ${n(r.growth)} Mbps`,
+      `Agent burst factor ${s.burst}: IS ${n(r.burst)} (other demand and overlap held constant)`,
+      "",
+      "SCOPE AND CAPACITY",
+      `Users: ${s.users} | Nominal bandwidth B: ${s.bandwidth} Mbps`,
+      `Reliable capacity A: ${s.availability}% | Latency class LL: ${s.latency}`,
+      `Utilization ceiling rho: ${s.ceiling}% (editable planning assumption)`,
+      `Background beta: ${s.background}% | Human security overhead: ${s.humanSecurity}%`,
+      "",
+      "HUMAN TRAFFIC",
+      s.humanMeasured
+        ? `Measured aggregate override: ${s.humanMbps} Mbps; includes background and inspection.`
+        : "Estimated: U * sum(share * rate) * (1 + beta) * (1 + human security)."
+    ];
+
+    s.human.forEach(x => lines.push(
+      `${x.name}: share ${x.share}%, active rate ${x.rate} Mbps`
+    ));
+
+    lines.push("", "HUMAN DRIVEN AI");
+
+    s.ai.forEach((x, i) => lines.push(
+      `${x.name}: ${n(r.aiRows[i])} Mbps`,
+      x.measured
+        ? `Measured aggregate ${x.mbps} Mbps; includes security.`
+        : `Population ${x.users}, adoption ${x.adoption}%, concurrency ${x.concurrency}%, active rate ${x.rate} Mbps, security ${x.security}%.`
+    ));
+
+    lines.push("", "AI SERVICE PIPELINES (measured Mbps, including inspection)");
+    s.services.forEach(x => lines.push(`${x.name}: ${x.mbps} Mbps`));
+    if (!s.services.length) lines.push("No service pipelines entered.");
+
+    lines.push("", "AGENT WORKFLOWS");
+
+    s.agents.forEach((x, i) => {
+      lines.push(
+        `${x.name}: ${n(r.agentRows[i])} Mbps`,
+        x.measured
+          ? `Measured aggregate ${x.mbps} Mbps; includes security.`
+          : `Agents ${x.count}, runs/agent/hour ${x.runs}, security ${x.security}%, MB/run ${n(r.volumes[i])}`
+      );
+
+      x.calls.forEach(c => lines.push(
+        `  ${c.name}: ${c.count} calls/run * ${c.mb} MB/call * ${c.retry} retry factor`
+      ));
+    });
+
+    lines.push("", "ADDITIONAL WORKLOAD CLASSES");
+
+    s.other.forEach((x, i) => lines.push(
+      `${x.name}: ${n(r.others[i])} Mbps; population ${x.population}, participation ${x.share}%, transferring ${x.active}%, active rate ${x.rate} Mbps, security ${x.security}%`
+    ));
+
+    if (!s.other.length) lines.push("No additional classes entered.");
+
+    lines.push(
+      "",
+      "FORMULAS AND INTERPRETATION",
+      "IS = (D_H + D_AI + D_AG + D_other - overlap) / (B * A * rho).",
+      "D_AI = sum(users * adoption * concurrency * AIW * (1 + security)) + services.",
+      "D_AG = sum(agents * runs/hour * MB/run * 8 / 3600 * (1 + security)).",
+      "MB/run = sum(calls/run * MB/call * retry factor). Decimal MB = 1,000,000 bytes.",
+      "D_other = population * participation * transferring fraction * active Mbps * (1 + security).",
+      "Measured overrides replace the full class estimate; no additional concurrency or overhead.",
+      "Bands: <0.60 Headroom; 0.60 to <0.85 Watch; 0.85 to 1.00 Plan; >1.00 Overloaded.",
+      "IS=1 is the modeled latency ceiling. This is a capacity estimate, not measured proof of latency.",
+      "The 0.85 target is a growth buffer; do not subtract another reserve from usable capacity.",
+      "Score one link, one direction, one interval. Call payloads must represent bytes crossing that",
+      "direction only. Split request and response traffic when scoring ingress and egress separately.",
+      "AI profiles must cover distinct populations or distinct traffic to avoid double counting.",
+      "Measured rates and pipeline rates include inspection. Remove duplicated demand as overlap.",
+      "Check actual RTT, jitter, loss, bursts and inspection session limits separately.",
+      "Source: Modeling Network Load in the AI Era v2, Scott O Andersen, October 13 2026.",
+      "Full precision is used; source worked examples round intermediate values.",
+      "",
+      "ASSESSMENT NOTES",
+      s.notes || "No notes provided."
+    );
+
+    return lines;
+  }
+
+  const $ = id => document.getElementById(id);
+
+  const esc = value => String(value).replace(/[&<>"']/g, character => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  }[character]));
+
+  const key = "cti-bandwidth-v1";
+  let s = defaults();
+  let tab = "Scope";
+
+  try {
+    const stored = JSON.parse(localStorage.getItem(key));
+    if (stored) {
+      assertShape(stored);
+      s = stored;
+    }
+  } catch {}
+
+  function assertShape(a) {
+    if (a.version !== 1) throw Error("Unsupported assessment version");
+
+    for (const k of Object.keys(defaults())) {
+      if (!(k in a)) throw Error("Missing " + k);
+    }
+
+    for (const k of ["human", "ai", "services", "agents", "other"]) {
+      if (!Array.isArray(a[k]) || a[k].length > 500) {
+        throw Error("Invalid " + k);
+      }
+    }
+
+    for (const x of a.agents) {
+      if (!Array.isArray(x.calls) || x.calls.length > 500) {
+        throw Error("Invalid agent call graph");
+      }
+    }
+
+    if (validate(a).length) throw Error(validate(a)[0]);
+  }
+
+  const num = (value, digits = 1) =>
+    Number(value).toLocaleString("en-US", {
+      maximumFractionDigits: digits
+    });
+
+  const pct = value => value === null ? "N/A" : num(value * 100) + "%";
+
+  function get(path) {
+    return path.split(".").reduce((object, k) => object[k], s);
+  }
+
+  function put(path, value) {
+    const parts = path.split(".");
+    const k = parts.pop();
+    parts.reduce((object, k) => object[k], s)[k] = value;
+  }
+
+  function input(label, path, hint = "", max = "", min = "0") {
+    return `
+      <label>${label}
+        <input
+          data-path="${path}"
+          type="number"
+          min="${min}"
+          ${max !== "" ? `max="${max}"` : ""}
+          step="any"
+          value="${esc(get(path))}">
+        ${hint ? `<span class="hint">${hint}</span>` : ""}
+      </label>`;
+  }
+
+  function text(label, path, full = false) {
+    return `
+      <label class="${full ? "full" : ""}">${label}
+        <input data-path="${path}" value="${esc(get(path))}" maxlength="300">
+      </label>`;
+  }
+
+  function check(label, path) {
+    return `
+      <label class="check">
+        <input type="checkbox" data-path="${path}" ${get(path) ? "checked" : ""}>
+        ${label}
+      </label>`;
+  }
+
+  const remove = path => `
+    <button class="remove" data-remove="${path}" aria-label="Remove entry">
+      Remove
+    </button>`;
+
+  const title = path => `
+    <div class="row-title">
+      <input
+        aria-label="Entry name"
+        maxlength="200"
+        data-path="${path}.name"
+        value="${esc(get(path + ".name"))}">
+      ${remove(path)}
+    </div>`;
+
+  const add = (kind, label) =>
+    `<button data-add="${kind}">+ ${label}</button>`;
+
+  const intro = (heading, paragraph) =>
+    `<h2>${heading}</h2><p class="intro">${paragraph}</p>`;
+
+  function render() {
+    $("tabs").innerHTML = [
+      "Scope", "Human", "AI & services", "Agents", "Other"
+    ].map(t => `
+      <button
+        class="${tab === t ? "selected" : ""}"
+        data-tab="${t}"
+        aria-current="${tab === t ? "page" : "false"}">${t}</button>
+    `).join("");
+
+    let h = "";
+
+    if (tab === "Scope") {
+      h = intro(
+        "Define the observation point",
+        "Create a separate assessment for each constrained link and direction. All inputs must describe the same observation interval."
+      ) + `
+        <div class="grid">
+          ${text("Assessment name", "title")}
+          ${text("Link / observation point", "link")}
+          ${text("Report date", "date")}
+          <label>Direction
+            <select data-path="direction">
+              ${["Ingress", "Egress"].map(v =>
+                `<option ${s.direction === v ? "selected" : ""}>${v}</option>`
+              ).join("")}
+            </select>
+          </label>
+          ${text("Observation interval", "interval")}
+          ${input("Users crossing this link", "users")}
+          ${input(
+            "Engineered bandwidth B · Mbps",
+            "bandwidth",
+            "10 Gbps = 10,000 Mbps",
+            "",
+            "0.001"
+          )}
+          ${input(
+            "Reliable capacity A · %",
+            "availability",
+            "Capacity share available during the modeled condition. Not an uptime SLA.",
+            100,
+            0.001
+          )}
+          <label>Latency sensitivity LL
+            <select data-path="latency" data-number="true">
+              ${ceilings.map((c, i) => `
+                <option value="${i + 1}" ${s.latency === i + 1 ? "selected" : ""}>
+                  ${i + 1} · ${[
+                    "Batch / bulk",
+                    "Web / SaaS",
+                    "Interactive AI",
+                    "Voice / real time",
+                    "Safety / control"
+                  ][i]} · ${c}%
+                </option>
+              `).join("")}
+            </select>
+            <span class="hint">Changing class sets its default ceiling below.</span>
+          </label>
+          ${input(
+            "Usable utilization ceiling ρ · %",
+            "ceiling",
+            "Editable. Use the strictest shared class without QoS.",
+            100,
+            0.001
+          )}
+          ${input(
+            "Duplicate traffic overlap O · Mbps",
+            "overlap",
+            "Remove bytes counted in more than one category."
+          )}
+          ${input(
+            "Agent burst multiplier",
+            "burst",
+            "Applied only to agent demand; all other inputs stay fixed.",
+            "",
+            "1"
+          )}
+          <label class="full">Assessment notes
+            <textarea data-path="notes" maxlength="10000">${esc(s.notes)}</textarea>
+          </label>
+        </div>`;
+    }
+
+    if (tab === "Human") {
+      h = intro(
+        "Human activity",
+        "Add or edit every activity class. Estimated demand uses users × sum(participation × rate), plus background and inspection overhead."
+      ) + check(
+        "Use measured human aggregate instead of the estimate",
+        "humanMeasured"
+      );
+
+      if (s.humanMeasured) {
+        h += input(
+          "Measured human traffic · Mbps",
+          "humanMbps",
+          "Include background and inspection. The editable categories below are excluded from the calculation."
+        );
+      }
+
+      h += `
+        <div class="grid">
+          ${input("Background β · %", "background")}
+          ${input("Security overhead · %", "humanSecurity", "CS 2 default: 5%")}
+        </div>` +
+        s.human.map((r, i) => `
+          <div class="row-card">
+            ${title("human." + i)}
+            <div class="grid">
+              ${input("Busy hour participation · %", `human.${i}.share`, "", 100)}
+              ${input("Rate while active · Mbps", `human.${i}.rate`)}
+            </div>
+          </div>
+        `).join("") +
+        add("human", "Add human activity");
+    }
+
+    if (tab === "AI & services") {
+      h = intro(
+        "AI sessions and service pipelines",
+        "Add distinct user populations or workloads. Use direct measured rates when available. Service rates include inspection overhead."
+      ) + s.ai.map((r, i) => {
+        const p = "ai." + i;
+
+        return `
+          <div class="row-card">
+            ${title(p)}
+            ${check("Use measured aggregate including inspection", p + ".measured")}
+            ${r.measured
+              ? input("Measured Mbps", p + ".mbps")
+              : `
+                <div class="smallgrid">
+                  ${input(
+                    "Users in this profile",
+                    p + ".users",
+                    "Independent of the scope user count."
+                  )}
+                  ${input("Adoption α · %", p + ".adoption", "", 100)}
+                  ${input("Busy hour concurrency κ · %", p + ".concurrency", "", 100)}
+                  ${input("Active session AIW · Mbps", p + ".rate")}
+                  ${input("Security overhead · %", p + ".security", "CS 3 default: 10%")}
+                </div>`}
+          </div>`;
+      }).join("") +
+      add("ai", "Add AI profile") +
+      `<hr class="divider">
+       <h3>Service pipelines S_AI</h3>
+       <p class="intro">Scheduled inference, ingestion, embedding refreshes, model or
+       data movement. Enter the measured total crossing this link.</p>` +
+      s.services.map((r, i) => `
+        <div class="row-card">
+          ${title("services." + i)}
+          ${input(
+            "Measured rate including inspection · Mbps",
+            "services." + i + ".mbps"
+          )}
+        </div>
+      `).join("") +
+      add("services", "Add service pipeline");
+    }
+
+    if (tab === "Agents") {
+      h = intro(
+        "Agent workflows",
+        "Size each workflow by its call graph. Payload is decimal MB crossing this observation point in the selected direction. Retry factor 1 means no retries."
+      ) + s.agents.map((r, i) => {
+        const p = "agents." + i;
+
+        return `
+          <div class="row-card">
+            ${title(p)}
+            ${check(
+              "Use measured workflow aggregate including inspection",
+              p + ".measured"
+            )}
+            ${r.measured
+              ? input("Measured Mbps", p + ".mbps")
+              : `
+                <div class="smallgrid">
+                  ${input("Agent population", p + ".count")}
+                  ${input("Runs per agent per hour", p + ".runs")}
+                  ${input("Security overhead · %", p + ".security", "CS 4 default: 15%")}
+                </div>`}
+            <div class="calls">
+              <h3>Call graph</h3>
+              ${r.measured
+                ? `<p class="muted">Retained for reference; not used while measured override is enabled.</p>`
+                : ""}
+              ${r.calls.map((c, j) => {
+                const q = p + ".calls." + j;
+                return `
+                  <div class="call">
+                    ${text("Call type", q + ".name")}
+                    ${input("Calls / run", q + ".count")}
+                    ${input("MB / call", q + ".mb")}
+                    ${input("Retry factor", q + ".retry", "", "", "1")}
+                    ${remove(q)}
+                  </div>`;
+              }).join("")}
+              <p class="muted">${num(calculate(s).volumes[i], 3)} MB per run</p>
+              ${add(p + ".calls", "Add call type")}
+            </div>
+          </div>`;
+      }).join("") +
+      add("agents", "Add agent workflow");
+    }
+
+    if (tab === "Other") {
+      h = intro(
+        "Additional workload categories",
+        "Extend the model for devices, non-AI automation or any new traffic class. Demand = population × participation × fraction actively transferring × active Mbps × (1 + security)."
+      ) + s.other.map((r, i) => {
+        const p = "other." + i;
+
+        return `
+          <div class="row-card">
+            ${title(p)}
+            <div class="smallgrid">
+              ${input("Population", p + ".population")}
+              ${input("Participation · %", p + ".share", "", 100)}
+              ${input("Actively transferring · %", p + ".active", "", 100)}
+              ${input("Rate when active · Mbps", p + ".rate")}
+              ${input("Security overhead · %", p + ".security")}
+            </div>
+          </div>`;
+      }).join("") +
+      add("other", "Add workload category");
+    }
+
+    $("form").innerHTML = h;
+    update();
+  }
+
+  function update() {
+    const errors = validate(s);
+    const r = calculate(s);
+
+    if (s.overlap > r.gross) {
+      errors.push("Overlap cannot exceed total gross demand.");
+    }
+
+    if (!Number.isFinite(r.total) || !Number.isFinite(r.is)) {
+      errors.push("The inputs exceed the supported numeric range.");
+    }
+
+    $("errors").textContent = errors.slice(0, 5).join(" ");
+    $("pdf").disabled = !!errors.length;
+    $("scenarioName").textContent = s.title || "Untitled assessment";
+
+    if (errors.length) {
+      $("results").innerHTML =
+        '<div class="result-card">Correct the highlighted input errors to calculate results.</div>';
+      return;
+    }
+
+    try {
+      localStorage.setItem(key, JSON.stringify(s));
+      $("saved").textContent = "Saved in this browser";
+    } catch {
+      $("saved").textContent = "Browser storage unavailable — export inputs to save";
+    }
+
+    const metric = (label, value) => `
+      <div class="metric"><span>${label}</span><b>${value}</b></div>`;
+
+    const colors = ["#266e65", "#80aaa0", "#d8ad65", "#849bb1"];
+
+    $("results").innerHTML = `
+      <div class="result-card ${r.is > 1 ? "bad" : ""}">
+        <h3>Impact score</h3>
+        <div class="score">${num(r.is, 3)}</div>
+        <span class="status">${r.status}</span>
+        <div class="gauge">
+          <i style="left:${Math.min(100, Math.max(0, r.is * 100))}%"></i>
+        </div>
+        ${metric("Total busy hour demand", num(r.total) + " Mbps")}
+        ${metric("Usable capacity", num(r.capacity) + " Mbps")}
+        ${metric("Nominal link utilization", pct(r.raw))}
+        <p class="advice">${
+          r.is < 0.6
+            ? "Capacity is within the modeled headroom band. Monitor and refresh measured inputs."
+            : r.is < 0.85
+              ? "Baseline with flow data, confirm QoS and plan the next capacity increment."
+              : r.is <= 1
+                ? "Fund an upgrade or offload plan. Demand is approaching the modeled latency ceiling."
+                : "Demand exceeds the modeled latency ceiling. Increase capacity or reduce load, then validate service performance."
+        }</p>
+      </div>
+
+      <div class="result-card">
+        <h3>Demand composition</h3>
+        <div class="bar">
+          ${[r.human, r.ai, r.agents, r.other].map((value, i) =>
+            `<span style="width:${r.gross ? value / r.gross * 100 : 0}%;background:${colors[i]}"></span>`
+          ).join("")}
+        </div>
+        ${metric("Human activity", num(r.human) + " Mbps")}
+        ${metric("AI + service pipelines", num(r.ai) + " Mbps")}
+        ${metric("Agents", num(r.agents) + " Mbps")}
+        ${metric("Other workloads", num(r.other) + " Mbps")}
+        ${metric("Overlap removed", "−" + num(s.overlap) + " Mbps")}
+        ${metric("AI / human uplift", pct(r.aiUplift))}
+        ${metric("Agents / human uplift", pct(r.agentUplift))}
+      </div>
+
+      <div class="result-card">
+        <h3>Capacity outlook</h3>
+        ${metric("Remaining usable capacity", num(r.remaining) + " Mbps")}
+        ${metric("Nominal capacity at IS 1", num(r.required) + " Mbps")}
+        ${metric("Nominal capacity at IS 0.85", num(r.growth) + " Mbps")}
+        ${metric("Agent burst score ×" + s.burst, num(r.burst, 3))}
+        <p class="advice">Planning estimates. Verify latency, loss, bursts and
+        inspection capacity against measured service requirements.</p>
+      </div>`;
+  }
+
+  document.addEventListener("input", event => {
+    const path = event.target.dataset.path;
+    if (!path) return;
+
+    const value = event.target.type === "checkbox"
+      ? event.target.checked
+      : event.target.type === "number"
+        ? event.target.value === "" ? NaN : Number(event.target.value)
+        : event.target.value;
+
+    put(path, value);
+    update();
+  });
+
+  document.addEventListener("change", event => {
+    const path = event.target.dataset.path;
+    if (!path) return;
+
+    if (event.target.tagName === "SELECT") {
+      put(
+        path,
+        event.target.dataset.number
+          ? Number(event.target.value)
+          : event.target.value
+      );
+
+      if (path === "latency") {
+        s.ceiling = ceilings[s.latency - 1];
+      }
+
+      render();
+    } else if (event.target.type === "checkbox") {
+      render();
+    }
+  });
+
+  document.addEventListener("click", event => {
+    const button = event.target.closest("button");
+    if (!button) return;
+
+    if (button.dataset.tab) {
+      tab = button.dataset.tab;
+      render();
+    }
+
+    if (button.dataset.remove) {
+      const path = button.dataset.remove.split(".");
+      const index = Number(path.pop());
+      get(path.join(".")).splice(index, 1);
+      render();
+    }
+
+    if (button.dataset.add) {
+      const kind = button.dataset.add;
+
+      const templates = {
+        human: {
+          name: "New human activity",
+          share: 0,
+          rate: 0
+        },
+        ai: {
+          name: "New AI profile",
+          users: s.users,
+          adoption: 0,
+          concurrency: 0,
+          rate: 0,
+          security: 10,
+          measured: false,
+          mbps: 0
+        },
+        services: {
+          name: "New service pipeline",
+          mbps: 0
+        },
+        agents: {
+          name: "New agent workflow",
+          count: 0,
+          runs: 0,
+          security: 15,
+          measured: false,
+          mbps: 0,
+          calls: []
+        },
+        other: {
+          name: "New workload",
+          population: 0,
+          share: 0,
+          active: 0,
+          rate: 0,
+          security: 0
+        }
+      };
+
+      get(kind).push(
+        kind.endsWith(".calls")
+          ? { name: "New call type", count: 0, mb: 0, retry: 1 }
+          : templates[kind]
+      );
+
+      render();
+    }
+  });
+
+  function download(blob, name) {
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = name;
+    anchor.click();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  }
+
+  $("pdf").onclick = () => download(
+    pdfBlob(reportLines(s, calculate(s))),
+    "bandwidth-report.pdf"
+  );
+
+  $("export").onclick = () => download(
+    new Blob([JSON.stringify(s, null, 2)], { type: "application/json" }),
+    "bandwidth-assessment.json"
+  );
+
+  $("import").onclick = () => $("file").click();
+
+  $("file").onchange = async event => {
+    try {
+      const file = event.target.files[0];
+      if (!file) return;
+      if (file.size > 2000000) {
+        throw Error("Assessment must be smaller than 2 MB.");
+      }
+
+      const assessment = JSON.parse(await file.text());
+      assertShape(assessment);
+
+      if (assessment.overlap > calculate(assessment).gross) {
+        throw Error("Overlap exceeds demand");
+      }
+
+      s = assessment;
+      render();
+    } catch (error) {
+      $("errors").textContent = "Import failed: " + error.message;
+    }
+
+    event.target.value = "";
+  };
+
+  $("demo").onclick = () => {
+    if (confirm(
+      "Replace current inputs with the document example? Export your inputs first if needed."
+    )) {
+      s = defaults();
+      render();
+    }
+  };
+
+  $("blank").onclick = () => {
+    if (confirm(
+      "Start a new assessment? Export your current inputs first if needed."
+    )) {
+      s = defaults();
+
+      Object.assign(s, {
+        title: "New bandwidth assessment",
+        link: "",
+        notes: "",
+        users: 0,
+        human: [],
+        ai: [],
+        agents: [],
+        services: [],
+        other: []
+      });
+
+      tab = "Scope";
+      render();
+    }
+  };
+
+  render();
+})();
+</script>
+</body>
+</html>
